@@ -1456,16 +1456,7 @@ static void __init do_pre_smp_initcalls(void)
 
 static int run_init_process(const char *init_filename)
 {
-	const char *const *p;
-
 	argv_init[0] = init_filename;
-	pr_info("Run %s as init process\n", init_filename);
-	pr_debug("  with arguments:\n");
-	for (p = argv_init; *p; p++)
-		pr_debug("    %s\n", *p);
-	pr_debug("  with environment:\n");
-	for (p = envp_init; *p; p++)
-		pr_debug("    %s\n", *p);
 	return kernel_execve(init_filename, argv_init, envp_init);
 }
 
@@ -1546,8 +1537,16 @@ static int __ref kernel_init(void *unused)
 	wait_for_completion(&kthreadd_done);
 
 	kernel_init_freeable();
-	/* need to finish all async __init code before freeing the memory */
-	async_synchronize_full();
+	{
+		extern bool rg55g1_block_deferred;
+
+		/*
+		 * async_synchronize_full() waits on every async domain and can
+		 * wedge forever on this bring-up (blocked deferred probes, etc.).
+		 */
+		if (!rg55g1_block_deferred)
+			async_synchronize_full();
+	}
 
 	system_state = SYSTEM_FREEING_INITMEM;
 	kprobe_free_init_mem();
@@ -1666,14 +1665,20 @@ static noinline void __init kernel_init_freeable(void)
 	 * check if there is an early userspace init.  If yes, let it do all
 	 * the work
 	 */
-	int ramdisk_command_access;
-	ramdisk_command_access = init_eaccess(ramdisk_execute_command);
-	if (ramdisk_command_access != 0) {
-		if (ramdisk_execute_command_set)
-			pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
-				ramdisk_execute_command, ramdisk_command_access);
-		ramdisk_execute_command = NULL;
-		prepare_namespace();
+	{
+		extern bool rg55g1_block_deferred;
+		int ramdisk_command_access;
+
+		ramdisk_command_access = init_eaccess(ramdisk_execute_command);
+		if (ramdisk_command_access != 0) {
+			if (ramdisk_execute_command_set)
+				pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
+					ramdisk_execute_command, ramdisk_command_access);
+			ramdisk_execute_command = NULL;
+			/* prepare_namespace() hangs with no root= on this bring-up */
+			if (!rg55g1_block_deferred)
+				prepare_namespace();
+		}
 	}
 
 	/*

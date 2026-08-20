@@ -915,6 +915,8 @@ static const struct dev_pm_ops dwc3_qcom_dev_pm_ops = {
 
 static const struct of_device_id dwc3_qcom_of_match[] = {
 	{ .compatible = "qcom,dwc3" },
+	/* Android / stock RavelinP vendor DT */
+	{ .compatible = "qcom,dwc-usb3-msm" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, dwc3_qcom_of_match);

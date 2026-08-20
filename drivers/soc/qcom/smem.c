@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include <linux/soc/qcom/smem.h>
 #include <linux/soc/qcom/socinfo.h>
+#include <linux/printk.h>
 
 #include "smem.h"
 
@@ -1248,17 +1249,23 @@ static int qcom_smem_probe(struct platform_device *pdev)
 		return ret;
 
 	smem->debugfs_dir = smem_dram_parse(smem, smem->dev);
+	if (IS_ERR(smem->debugfs_dir))
+		smem->debugfs_dir = NULL;
+
+	{
+		extern bool rg55g1_block_deferred;
+
+		/* Freeze deferred retries that hang on stock DT bring-up. */
+		rg55g1_block_deferred = true;
+	}
 
 	__smem = smem;
 
-	smem->socinfo = platform_device_register_data(&pdev->dev, "qcom-socinfo",
-						      PLATFORM_DEVID_NONE, NULL,
-						      0);
-	if (IS_ERR(smem->socinfo)) {
-		debugfs_remove_recursive(smem->debugfs_dir);
-
-		dev_dbg(&pdev->dev, "failed to register socinfo device\n");
-	}
+	/*
+	 * Skip socinfo during bring-up: registering it can kick deferred
+	 * probes (USB/SMMU/SPMI/…) that hang on this stock DT.
+	 */
+	smem->socinfo = NULL;
 
 	return 0;
 }
@@ -1267,7 +1274,8 @@ static void qcom_smem_remove(struct platform_device *pdev)
 {
 	debugfs_remove_recursive(__smem->debugfs_dir);
 
-	platform_device_unregister(__smem->socinfo);
+	if (__smem->socinfo)
+		platform_device_unregister(__smem->socinfo);
 
 	xa_destroy(&__smem->partitions);
 	/* Set to -EPROBE_DEFER to signal unprobed state */

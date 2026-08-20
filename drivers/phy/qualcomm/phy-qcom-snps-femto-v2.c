@@ -503,6 +503,8 @@ static const struct of_device_id qcom_snps_hsphy_of_match_table[] = {
 		.data		= &sc7280_snps_7nm_phy,
 	},
 	{ .compatible	= "qcom,usb-snps-femto-v2-phy",	},
+	/* stock Android RavelinP / SG4250P */
+	{ .compatible	= "qcom,usb-hsphy-snps-femto",	},
 	{ }
 };
 MODULE_DEVICE_TABLE(of, qcom_snps_hsphy_of_match_table);

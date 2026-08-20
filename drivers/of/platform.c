@@ -10,6 +10,7 @@
 #define pr_fmt(fmt)	"OF: " fmt
 
 #include <linux/errno.h>
+#include <linux/printk.h>
 #include <linux/module.h>
 #include <linux/amba/bus.h>
 #include <linux/device.h>
@@ -597,6 +598,7 @@ static int __init of_platform_default_populate_init(void)
 
 		/* Populate everything else. */
 		of_platform_default_populate(NULL, NULL, NULL);
+
 	}
 
 	return 0;

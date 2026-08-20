@@ -386,10 +386,10 @@ struct dentry *smem_dram_parse(struct qcom_smem *smem, struct device *dev)
 		/* Some SoCs don't provide data that's useful for us */
 		return ERR_PTR(-ENODATA);
 	} else if (ver == INFO_UNKNOWN) {
-		/* In other cases, we may not have added support for a newer struct revision */
-		dev_err(dev, "Found an unknown type of DRAM info struct (size = %zu)\n",
-			actual_size);
-		return ERR_PTR(-EINVAL);
+		/* Newer firmware DRAM info layouts — not fatal for bring-up */
+		dev_warn(dev, "Unknown DRAM info struct (size = %zu), ignoring\n",
+			 actual_size);
+		return ERR_PTR(-ENODATA);
 	}
 
 	dram = devm_kzalloc(dev, sizeof(*dram), GFP_KERNEL);

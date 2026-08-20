@@ -27,6 +27,13 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/regulator/consumer.h>
+#include <linux/vmalloc.h>
+
+/* Splash HW mapping used by flush path. */
+void __iomem *rg55g1_splash_hw;
+EXPORT_SYMBOL_GPL(rg55g1_splash_hw);
+
+struct fb_info *rg55g1_splash_info;
 
 static const struct fb_fix_screeninfo simplefb_fix = {
 	.id		= "simple",
@@ -74,6 +81,8 @@ struct simplefb_par {
 	resource_size_t base;
 	resource_size_t size;
 	struct resource *mem;
+	/* RG55G1 splash: draw in shadow (DRAM), flush dirty rects to HW */
+	void *hw_base;
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 	bool clks_enabled;
 	unsigned int clk_count;
@@ -107,8 +116,16 @@ static void simplefb_destroy(struct fb_info *info)
 	simplefb_regulators_destroy(info->par);
 	simplefb_clocks_destroy(info->par);
 	simplefb_detach_genpds(info->par);
-	if (info->screen_base)
-		iounmap(info->screen_base);
+	if (par->hw_base) {
+		if (rg55g1_splash_hw == par->hw_base)
+			rg55g1_splash_hw = NULL;
+		vfree(info->screen_base);
+		memunmap(par->hw_base);
+		info->screen_base = NULL;
+		par->hw_base = NULL;
+	} else if (info->screen_base) {
+		memunmap(info->screen_base);
+	}
 
 	framebuffer_release(info);
 
@@ -119,6 +136,104 @@ static void simplefb_destroy(struct fb_info *info)
 static const struct fb_ops simplefb_ops = {
 	.owner		= THIS_MODULE,
 	FB_DEFAULT_IOMEM_OPS,
+	.fb_destroy	= simplefb_destroy,
+	.fb_setcolreg	= simplefb_setcolreg,
+};
+
+/*
+ * Draw into a normal-RAM shadow, then copy dirty rectangles to the WC
+ * splash buffer. Keeps prior console pixels consistent (no in-place
+ * WC copyarea tear/"花").
+ *
+ * Quiet mode: never memcpy a wide×tall rect in one go — this panel's
+ * WC mapping hangs mid-transfer. Always use small tiles.
+ */
+static void rg55_flush_tile(struct fb_info *info, u32 dx, u32 dy,
+			      u32 width, u32 height)
+{
+	struct simplefb_par *par = info->par;
+	u8 *src = info->screen_base;
+	u8 *dst = par->hw_base;
+	u32 line = info->fix.line_length;
+	u32 bpp = info->var.bits_per_pixel / 8;
+	u32 y;
+
+	if (!src || !dst || !width || !height)
+		return;
+	if (dx >= info->var.xres || dy >= info->var.yres)
+		return;
+	if (dx + width > info->var.xres)
+		width = info->var.xres - dx;
+	if (dy + height > info->var.yres)
+		height = info->var.yres - dy;
+
+	for (y = 0; y < height; y++) {
+		size_t off = (size_t)(dy + y) * line + (size_t)dx * bpp;
+
+		memcpy(dst + off, src + off, (size_t)width * bpp);
+	}
+	wmb();
+}
+
+static void rg55_flush_rect_tiled(struct fb_info *info, u32 dx, u32 dy,
+				    u32 width, u32 height)
+{
+	u32 y, x;
+
+	for (y = 0; y < height; y += 8) {
+		u32 th = height - y;
+
+		if (th > 8)
+			th = 8;
+		for (x = 0; x < width; x += 64) {
+			u32 tw = width - x;
+
+			if (tw > 64)
+				tw = 64;
+			rg55_flush_tile(info, dx + x, dy + y, tw, th);
+		}
+	}
+}
+
+static void rg55_flush_rect(struct fb_info *info, u32 dx, u32 dy,
+			       u32 width, u32 height)
+{
+	/* Glyphs are tiny; still tile if somehow large. */
+	if (width * height > 64 * 8)
+		rg55_flush_rect_tiled(info, dx, dy, width, height);
+	else
+		rg55_flush_tile(info, dx, dy, width, height);
+}
+
+static void rg55_flush_all(struct fb_info *info)
+{
+	rg55_flush_rect_tiled(info, 0, 0, info->var.xres, info->var.yres);
+}
+
+static void rg55_fillrect(struct fb_info *info, const struct fb_fillrect *rect)
+{
+	sys_fillrect(info, rect);
+	rg55_flush_rect_tiled(info, rect->dx, rect->dy, rect->width, rect->height);
+}
+
+static void rg55_copyarea(struct fb_info *info, const struct fb_copyarea *area)
+{
+	sys_copyarea(info, area);
+	rg55_flush_rect_tiled(info, area->dx, area->dy, area->width, area->height);
+}
+
+static void rg55_imageblit(struct fb_info *info, const struct fb_image *image)
+{
+	sys_imageblit(info, image);
+	rg55_flush_tile(info, image->dx, image->dy, image->width, image->height);
+}
+
+static const struct fb_ops rg55_splash_ops = {
+	.owner		= THIS_MODULE,
+	__FB_DEFAULT_SYSMEM_OPS_RDWR,
+	.fb_fillrect	= rg55_fillrect,
+	.fb_copyarea	= rg55_copyarea,
+	.fb_imageblit	= rg55_imageblit,
 	.fb_destroy	= simplefb_destroy,
 	.fb_setcolreg	= simplefb_setcolreg,
 };
@@ -559,6 +674,17 @@ static int simplefb_probe(struct platform_device *pdev)
 		res = &params.memory;
 	}
 
+	/*
+	 * RG55G1: early_initcall already owns continuous-splash scanout.
+	 * A second map/register of the same buffer causes a noisy/corrupt
+	 * display (two writers + leftover bars).
+	 */
+	if (res->start == 0xb8000000ULL) {
+		dev_info(&pdev->dev,
+			 "skip DT simplefb @0xb8000000 (splash console owns it)\n");
+		return -ENODEV;
+	}
+
 	mem = request_mem_region(res->start, resource_size(res), "simplefb");
 	if (!mem) {
 		/*
@@ -599,8 +725,12 @@ static int simplefb_probe(struct platform_device *pdev)
 	par->size = info->fix.smem_len;
 
 	info->fbops = &simplefb_ops;
-	info->screen_base = ioremap_wc(info->fix.smem_start,
-				       info->fix.smem_len);
+	/*
+	 * Continuous-splash is in a reserved no-map region; ioremap_wc()
+	 * can hang on this platform — use memremap(WC) instead.
+	 */
+	info->screen_base = memremap(info->fix.smem_start,
+				      info->fix.smem_len, MEMREMAP_WC);
 	if (!info->screen_base) {
 		ret = -ENOMEM;
 		goto error_fb_release;
@@ -634,8 +764,13 @@ static int simplefb_probe(struct platform_device *pdev)
 
 	ret = devm_aperture_acquire_for_platform_device(pdev, par->base, par->size);
 	if (ret) {
-		dev_err(&pdev->dev, "Unable to acquire aperture: %d\n", ret);
-		goto error_genpds;
+		/*
+		 * Bring-up: EFI/sysfb may already own the region; still
+		 * register so fbcon can draw on continuous splash.
+		 */
+		dev_warn(&pdev->dev,
+			 "aperture acquire failed (%d), registering anyway\n",
+			 ret);
 	}
 	ret = register_framebuffer(info);
 	if (ret < 0) {
@@ -654,7 +789,7 @@ error_regulators:
 error_clocks:
 	simplefb_clocks_destroy(par);
 error_unmap:
-	iounmap(info->screen_base);
+	memunmap(info->screen_base);
 error_fb_release:
 	framebuffer_release(info);
 error_release_mem_region:
@@ -687,6 +822,87 @@ static struct platform_driver simplefb_driver = {
 };
 
 module_platform_driver(simplefb_driver);
+
+/*
+ * RG55G1: must NOT register FB from console_initcall — console_lock is held
+ * and fbcon takeover deadlocks. early_initcall runs after console_init.
+ */
+static int __init rg55g1_splash_console_init(void)
+{
+	struct fb_info *info;
+	struct simplefb_par *par;
+	void *shadow;
+	void *hw;
+	size_t len = 1080UL * 1920UL * 4;
+	phys_addr_t phys = 0xb8000000UL;
+	unsigned int stride = 1080;
+
+	hw = memremap(phys, len, MEMREMAP_WC);
+	if (!hw)
+		hw = memremap(phys, len, MEMREMAP_WB);
+	if (!hw)
+		return 0;
+
+	shadow = vzalloc(len);
+	if (!shadow) {
+		memunmap(hw);
+		return 0;
+	}
+
+	/* Black splash; kernel log / fbcon takes over. */
+	memset(hw, 0, len);
+	wmb();
+	memset(shadow, 0, len);
+
+	info = framebuffer_alloc(sizeof(*par), NULL);
+	if (!info) {
+		vfree(shadow);
+		memunmap(hw);
+		return 0;
+	}
+
+	par = info->par;
+	info->fix = simplefb_fix;
+	strscpy(info->fix.id, "rg55splash", sizeof(info->fix.id));
+	info->fix.smem_start = phys;
+	info->fix.smem_len = len;
+	info->fix.line_length = stride * 4;
+	info->var = simplefb_var;
+	info->var.xres = 1080;
+	info->var.yres = 1920;
+	info->var.xres_virtual = 1080;
+	info->var.yres_virtual = 1920;
+	info->var.bits_per_pixel = 32;
+	info->var.red.offset = 16;
+	info->var.red.length = 8;
+	info->var.green.offset = 8;
+	info->var.green.length = 8;
+	info->var.blue.offset = 0;
+	info->var.blue.length = 8;
+	info->fbops = &rg55_splash_ops;
+	info->flags = FBINFO_VIRTFB | FBINFO_HWACCEL_DISABLED;
+	info->screen_base = shadow;
+	info->pseudo_palette = par->palette;
+	par->base = phys;
+	par->size = len;
+	par->mem = NULL;
+	par->hw_base = hw;
+	rg55g1_splash_hw = hw;
+	rg55g1_splash_info = info;
+
+	if (register_framebuffer(info) < 0) {
+		rg55g1_splash_hw = NULL;
+		rg55g1_splash_info = NULL;
+		vfree(shadow);
+		memunmap(hw);
+		framebuffer_release(info);
+		return 0;
+	}
+
+	pr_debug("rg55g1: splash fb + shadow buffer registered\n");
+	return 0;
+}
+early_initcall(rg55g1_splash_console_init);
 
 MODULE_AUTHOR("Stephen Warren <swarren@wwwdotorg.org>");
 MODULE_DESCRIPTION("Simple framebuffer driver");

@@ -173,10 +173,36 @@ static bool driver_deferred_probe_enable;
  * changes in the midst of a probe, then deferred processing should be triggered
  * again.
  */
+bool rg55g1_block_deferred;
+EXPORT_SYMBOL_GPL(rg55g1_block_deferred);
+
+void rg55g1_dump_deferred_pending(void)
+{
+	struct device_private *curr;
+	int n = 0;
+
+	mutex_lock(&deferred_probe_mutex);
+	list_for_each_entry(curr, &deferred_probe_pending_list, deferred_probe) {
+		pr_err("rg55g1: deferred pending: %s (%s)\n",
+		       dev_name(curr->device),
+		       curr->deferred_probe_reason ?: "no reason");
+		if (++n >= 40)
+			break;
+	}
+	pr_err("rg55g1: deferred pending count (shown up to 40): %d\n", n);
+	mutex_unlock(&deferred_probe_mutex);
+}
+EXPORT_SYMBOL_GPL(rg55g1_dump_deferred_pending);
+
 void driver_deferred_probe_trigger(void)
 {
 	if (!driver_deferred_probe_enable)
 		return;
+
+	if (rg55g1_block_deferred) {
+		pr_info_once("rg55g1: deferred probe trigger blocked\n");
+		return;
+	}
 
 	/*
 	 * A successful probe means that all the devices in the pending list
@@ -454,7 +480,9 @@ static void driver_bound(struct device *dev)
 		__func__);
 
 	klist_add_tail(&dev->p->knode_driver, &dev->driver->p->klist_devices);
+
 	device_links_driver_bound(dev);
+
 
 	device_pm_check_callbacks(dev);
 
@@ -704,6 +732,7 @@ re_probe:
 	}
 
 	ret = call_driver_probe(dev, drv);
+
 	if (ret) {
 		/*
 		 * If fw_devlink_best_effort is active (denoted by -EAGAIN), the
@@ -722,11 +751,13 @@ re_probe:
 		goto probe_failed;
 	}
 
+
 	ret = device_add_groups(dev, drv->dev_groups);
 	if (ret) {
 		dev_err(dev, "device_add_groups() failed\n");
 		goto dev_groups_failed;
 	}
+
 
 	if (dev_has_sync_state(dev)) {
 		ret = device_create_file(dev, &dev_attr_state_synced);
@@ -753,7 +784,10 @@ re_probe:
 	if (dev->pm_domain && dev->pm_domain->sync)
 		dev->pm_domain->sync(dev);
 
+
 	driver_bound(dev);
+
+
 	dev_dbg(dev, "bus: '%s': %s: bound device to driver %s\n",
 		drv->bus->name, __func__, drv->name);
 	goto done;
