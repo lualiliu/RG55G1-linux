@@ -51,16 +51,16 @@ static void xhci_rg55_wait_cmd(struct xhci_hcd *xhci,
 	}
 
 	/*
-	 * Drain a few times then sleep on the completion. Busy-spinning
-	 * xhci_irq() under contention with the poll worker hard-locks on
-	 * charger→keyboard plug sequences.
+	 * Drain a few times then sleep. Use irq-safe drain — plain xhci_irq()
+	 * from process context deadlocks when GIC finally delivers the IRQ
+	 * (keyboard unplug→replug).
 	 */
 	deadline = jiffies + msecs_to_jiffies(3000);
 	while (!completion_done(completion) && time_before(jiffies, deadline)) {
 		if (n++ < 32) {
-			xhci_irq(hcd);
+			xhci_rg55_drain_irq(hcd);
 			if (xhci->shared_hcd)
-				xhci_irq(xhci->shared_hcd);
+				xhci_rg55_drain_irq(xhci->shared_hcd);
 		}
 		usleep_range(1000, 2000);
 	}

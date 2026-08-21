@@ -1902,6 +1902,9 @@ int xhci_resume(struct xhci_hcd *xhci, bool power_lost, bool is_auto_resume);
 
 irqreturn_t xhci_irq(struct usb_hcd *hcd);
 irqreturn_t xhci_msi_irq(int irq, void *hcd);
+/* RG55G1: safe xhci_irq() from process context (poll / cmd wait). */
+void xhci_rg55_drain_irq(struct usb_hcd *hcd);
+bool xhci_rg55_drain_irq_if_idle(struct usb_hcd *hcd);
 int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev);
 int xhci_alloc_tt_info(struct xhci_hcd *xhci,
 		struct xhci_virt_device *virt_dev,

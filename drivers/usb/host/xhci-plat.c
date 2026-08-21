@@ -38,6 +38,10 @@ struct rg55g1_xhci_poll {
 	u32 last_u3;
 	u32 ticks;
 	bool did_reset;
+	/* After first CCS, never PORT_RESET / link-poke from poll again. */
+	bool ever_connected;
+	/* After CCS drop (PC/charger unplug), stay hands-off for hub_wq. */
+	unsigned long quiet_until;
 };
 
 /* PORTSC RW1C change bits — writing 1 clears; must mask when setting PP. */
@@ -51,6 +55,7 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 	struct usb_hcd *hcd;
 	u32 u2 = 0, u3 = 0;
 	char msg[48];
+	bool was_conn, ccs, quiet;
 	extern void rg55g1_status(const char *msg, u32 color);
 	extern bool rg55g1_usb_loose_supplies;
 
@@ -60,18 +65,48 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 	hcd = xhci->main_hcd;
 	p->ticks++;
 
-	/*
-	 * Drain event ring even if GIC delivery is silent — STS_EINT still
-	 * latches, and without this URBs/HID never complete.
-	 */
-	if (hcd)
-		(void)xhci_irq(hcd);
+	was_conn = !!(p->last_u2 & PORT_CONNECT);
+	if (hcd && xhci->usb2_rhub.ports && xhci->usb2_rhub.num_ports)
+		u2 = xhci_portsc_readl(xhci->usb2_rhub.ports[0]);
+	ccs = !!(u2 & PORT_CONNECT);
+
+	if (ccs)
+		p->ever_connected = true;
 
 	/*
-	 * Keep GUSB2PHYCFG.SUSPHY/ENBLSLPM clear, UTMI clock on, VBUS override
-	 * on (PMIC boost). Rotate a short register dump so we can see why CCS
-	 * stays 0.
+	 * PC/charger → unplug → keyboard: hub_wq is tearing down the previous
+	 * "device" while we used to keep draining + poll_rh + rewriting
+	 * HS_PHY_CTRL/PORTSC every 200ms — that hard-locks the controller.
+	 * After CCS edges, deliver one kick then stay quiet so disconnect /
+	 * first enumerate can finish without the poll worker fighting them.
 	 */
+	{
+		bool edge_kick = false;
+		bool allow;
+
+		if (was_conn && !ccs) {
+			p->quiet_until = jiffies + msecs_to_jiffies(1500);
+			edge_kick = true;
+		} else if (ccs && !was_conn) {
+			p->quiet_until = jiffies + msecs_to_jiffies(500);
+			edge_kick = true;
+		}
+
+		quiet = time_before(jiffies, p->quiet_until);
+		allow = !quiet || edge_kick;
+
+		/*
+		 * Drain only when idle (trylock): never race cmd-wait drain
+		 * during ENABLE_SLOT after keyboard plug.
+		 */
+		if (allow && hcd)
+			(void)xhci_rg55_drain_irq_if_idle(hcd);
+
+		/*
+		 * PHY keepalive — do not rewrite sessvld/VBUS every tick
+		 * (especially across PC↔keyboard). Only ensure UTMI clock
+		 * and !SUSPEND when not in quiet.
+		 */
 	{
 		static void __iomem *dwc_regs;
 		static void __iomem *qscratch;
@@ -88,22 +123,32 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 		if (!eud)
 			eud = ioremap(0x088e0000, 0x2000);
 
-		if (dwc_regs) {
+		if (allow && dwc_regs) {
 			cfg = readl(dwc_regs + 0xc200); /* GUSB2PHYCFG(0) */
 			if (cfg & (BIT(6) | BIT(8))) {
 				cfg &= ~(BIT(6) | BIT(8));
 				writel(cfg, dwc_regs + 0xc200);
 				cfg = readl(dwc_regs + 0xc200);
 			}
+		} else if (dwc_regs) {
+			cfg = readl(dwc_regs + 0xc200);
 		}
+
 		if (qscratch) {
 			hs = readl(qscratch + 0x10); /* HS_PHY_CTRL */
-			hs |= BIT(20) | BIT(28) | BIT(21); /* VBUS + UTMI_CLK_EN */
-			hs &= ~BIT(23);			   /* !USB2_SUSPEND */
-			writel(hs, qscratch + 0x10);
-			hs = readl(qscratch + 0x10);
+			if (allow) {
+				u32 want = hs | BIT(21); /* UTMI_CLK_EN */
+
+				want &= ~BIT(23);	 /* !USB2_SUSPEND */
+				/* Leave UTMI_OTG_VBUS_VALID / SW_SESSVLD_SEL */
+				if (want != hs) {
+					writel(want, qscratch + 0x10);
+					hs = readl(qscratch + 0x10);
+				}
+			}
 		}
-		if (hsphy) {
+
+		if (allow && hsphy) {
 			u32 c0, c2;
 			static void __iomem *gcc;
 			static bool phy_kicked;
@@ -127,21 +172,27 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 				utmi = readl(hsphy + 0x3c);
 				c0 = readl(hsphy + 0x54);
 			}
-			/* status: COMMON0 in high 16, UTMI in low 16 */
 			utmi = ((c0 & 0xffff) << 16) | (utmi & 0xffff);
+		} else if (hsphy) {
+			utmi = readl(hsphy + 0x3c);
 		}
+
 		if (eud)
 			ecsr = readl(eud + 0x1014); /* CSR_EUD_EN */
 
 		if (hcd && xhci->usb2_rhub.ports && xhci->usb2_rhub.num_ports) {
 			struct xhci_port *port = xhci->usb2_rhub.ports[0];
 			u32 pls;
-			bool was_conn = !!(p->last_u2 & PORT_CONNECT);
+			u32 change;
 
+			/* Re-read after possible drain */
 			u2 = xhci_portsc_readl(port);
 			pls = u2 & PORT_PLS_MASK;
+			ccs = !!(u2 & PORT_CONNECT);
+			if (ccs)
+				p->ever_connected = true;
 
-			if (!(u2 & PORT_POWER)) {
+			if (allow && !(u2 & PORT_POWER)) {
 				u32 tmp = xhci_port_state_to_neutral(u2) |
 					  PORT_POWER;
 
@@ -150,16 +201,11 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 				pls = u2 & PORT_PLS_MASK;
 			}
 
-			/* Unplug: re-arm one-shot reset for next plug. */
-			if (was_conn && !(u2 & PORT_CONNECT))
-				p->did_reset = false;
-
 			/*
-			 * Only poke link state when nothing is attached.
-			 * Charger/SDP then keyboard: rewriting PORTSC while
-			 * CCS=1 races hub reset and hard-locks the host.
+			 * Initial bring-up only. Never PORT_RESET after a PC
+			 * or keyboard has already connected once.
 			 */
-			if (!(u2 & PORT_CONNECT)) {
+			if (allow && !p->ever_connected && !ccs) {
 				if ((u2 & PORT_POWER) &&
 				    (pls == XDEV_DISABLED ||
 				     pls == XDEV_INACTIVE ||
@@ -185,25 +231,38 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 				}
 			}
 
-			set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
-			usb_hcd_poll_rh_status(hcd);
+			/*
+			 * Kick hub only on status change — periodic poll_rh
+			 * during PC→keyboard races hub_wq and hard-locks.
+			 */
+			change = (u2 ^ p->last_u2) &
+				 (PORT_CONNECT | PORT_CHANGE_MASK);
+			if (allow && change) {
+				set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+				usb_hcd_poll_rh_status(hcd);
+			}
 		}
-		if (xhci->shared_hcd && xhci->usb3_rhub.ports &&
+
+		if (allow && xhci->shared_hcd && xhci->usb3_rhub.ports &&
 		    xhci->usb3_rhub.num_ports) {
 			u3 = xhci_portsc_readl(xhci->usb3_rhub.ports[0]);
-			set_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
-			usb_hcd_poll_rh_status(xhci->shared_hcd);
+			if ((u3 ^ p->last_u3) &
+			    (PORT_CONNECT | PORT_CHANGE_MASK)) {
+				set_bit(HCD_FLAG_POLL_RH,
+					&xhci->shared_hcd->flags);
+				usb_hcd_poll_rh_status(xhci->shared_hcd);
+			}
 		}
 
 		/* Rotate: U2 portsc / HS_PHY_CTRL+GUSB2 / EUD+UTMI */
 		switch (p->ticks % 3) {
 		case 0:
-			snprintf(msg, sizeof(msg), "U2:c%dp%de%dL%x %08x",
+			snprintf(msg, sizeof(msg), "%sU2:c%dp%de%dL%x",
+				 quiet && !edge_kick ? "Q" : "",
 				 !!(u2 & PORT_CONNECT),
 				 !!(u2 & PORT_POWER),
 				 !!(u2 & PORT_PE),
-				 (u2 & PORT_PLS_MASK) >> 5,
-				 u2);
+				 (u2 & PORT_PLS_MASK) >> 5);
 			break;
 		case 1:
 			snprintf(msg, sizeof(msg), "H%08x G%08x", hs, cfg);
@@ -215,6 +274,7 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 		rg55g1_status(msg, (u2 & PORT_CONNECT) ? 0x0000ff00 : 0x00ffff00);
 		p->last_u2 = u2;
 		p->last_u3 = u3;
+	}
 	}
 
 	schedule_delayed_work(&p->work, msecs_to_jiffies(200));

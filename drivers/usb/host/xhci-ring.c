@@ -3258,6 +3258,47 @@ irqreturn_t xhci_msi_irq(int irq, void *hcd)
 }
 EXPORT_SYMBOL_GPL(xhci_msi_irq);
 
+/*
+ * RG55G1: xhci_irq() uses spin_lock(), not irqsave — it assumes IRQ context.
+ * Poll worker / cmd-wait call it from process context; without disabling IRQs,
+ * a late GIC delivery of the xHCI IRQ deadlocks on xhci->lock (seen on
+ * keyboard unplug→replug when the line finally fires).
+ *
+ * Also serialize poll vs wait_cmd: concurrent drain during PC/charger →
+ * keyboard plug hard-locks the host.
+ */
+static DEFINE_MUTEX(xhci_rg55_drain_mutex);
+
+void xhci_rg55_drain_irq(struct usb_hcd *hcd)
+{
+	unsigned long flags;
+
+	if (!hcd)
+		return;
+	mutex_lock(&xhci_rg55_drain_mutex);
+	local_irq_save(flags);
+	xhci_irq(hcd);
+	local_irq_restore(flags);
+	mutex_unlock(&xhci_rg55_drain_mutex);
+}
+EXPORT_SYMBOL_GPL(xhci_rg55_drain_irq);
+
+bool xhci_rg55_drain_irq_if_idle(struct usb_hcd *hcd)
+{
+	unsigned long flags;
+
+	if (!hcd)
+		return false;
+	if (!mutex_trylock(&xhci_rg55_drain_mutex))
+		return false;
+	local_irq_save(flags);
+	xhci_irq(hcd);
+	local_irq_restore(flags);
+	mutex_unlock(&xhci_rg55_drain_mutex);
+	return true;
+}
+EXPORT_SYMBOL_GPL(xhci_rg55_drain_irq_if_idle);
+
 /****		Endpoint Ring Operations	****/
 
 /*
