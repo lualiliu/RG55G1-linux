@@ -238,12 +238,20 @@ int usb_phy_gen_create_phy(struct device *dev, struct usb_phy_generic *nop)
 		return dev_err_probe(dev, PTR_ERR(nop->vcc),
 				     "could not get vcc regulator\n");
 
-	nop->vbus_draw = devm_regulator_get_exclusive(dev, "vbus");
+	nop->vbus_draw = devm_regulator_get_optional(dev, "vbus");
 	if (PTR_ERR(nop->vbus_draw) == -ENODEV)
 		nop->vbus_draw = NULL;
-	if (IS_ERR(nop->vbus_draw))
-		return dev_err_probe(dev, PTR_ERR(nop->vbus_draw),
-				     "could not get vbus regulator\n");
+	if (IS_ERR(nop->vbus_draw)) {
+		extern bool rg55g1_usb_loose_supplies;
+
+		if (rg55g1_usb_loose_supplies) {
+			dev_warn(dev, "rg55g1: continuing without vbus regulator\n");
+			nop->vbus_draw = NULL;
+		} else {
+			return dev_err_probe(dev, PTR_ERR(nop->vbus_draw),
+					     "could not get vbus regulator\n");
+		}
+	}
 
 	nop->dev		= dev;
 	nop->phy.dev		= nop->dev;
@@ -334,7 +342,7 @@ static int __init usb_phy_generic_init(void)
 {
 	return platform_driver_register(&usb_phy_generic_driver);
 }
-subsys_initcall(usb_phy_generic_init);
+arch_initcall(usb_phy_generic_init); /* RG55G1: usb-nop-xceiv */
 
 static void __exit usb_phy_generic_exit(void)
 {

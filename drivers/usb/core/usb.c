@@ -1288,7 +1288,7 @@ static void __exit usb_exit(void)
 	idr_destroy(&usb_bus_idr);
 }
 
-subsys_initcall(usb_init);
+arch_initcall(usb_init); /* RG55G1: need usbcore without full subsys level */
 module_exit(usb_exit);
 MODULE_DESCRIPTION("USB core host-side support");
 MODULE_LICENSE("GPL");

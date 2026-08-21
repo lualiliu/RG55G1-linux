@@ -13331,4 +13331,4 @@ out:
 	return rc;
 }
 
-subsys_initcall(net_dev_init);
+arch_initcall(net_dev_init); /* RG55G1: kobj netns before any device_initcall */

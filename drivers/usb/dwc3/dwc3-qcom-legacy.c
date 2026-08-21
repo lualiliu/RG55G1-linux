@@ -159,7 +159,13 @@ static int dwc3_qcom_register_extcon(struct dwc3_qcom *qcom)
 {
 	struct device		*dev = qcom->dev;
 	struct extcon_dev	*host_edev;
+	extern bool		rg55g1_usb_loose_supplies;
 	int			ret;
+
+	if (rg55g1_usb_loose_supplies) {
+		dev_warn(dev, "rg55g1: skipping extcon\n");
+		return 0;
+	}
 
 	if (!of_property_present(dev->of_node, "extcon"))
 		return 0;
@@ -245,18 +251,29 @@ static int dwc3_qcom_interconnect_init(struct dwc3_qcom *qcom)
 {
 	enum usb_device_speed max_speed;
 	struct device *dev = qcom->dev;
+	extern bool rg55g1_usb_loose_supplies;
 	int ret;
+
+	/* Stock ICC names/providers are not up during bring-up. */
+	if (rg55g1_usb_loose_supplies) {
+		qcom->icc_path_ddr = NULL;
+		qcom->icc_path_apps = NULL;
+		dev_warn(dev, "rg55g1: skipping interconnect\n");
+		return 0;
+	}
 
 	qcom->icc_path_ddr = of_icc_get(dev, "usb-ddr");
 	if (IS_ERR(qcom->icc_path_ddr)) {
-		return dev_err_probe(dev, PTR_ERR(qcom->icc_path_ddr),
-				     "failed to get usb-ddr path\n");
+		ret = PTR_ERR(qcom->icc_path_ddr);
+		qcom->icc_path_ddr = NULL;
+		return dev_err_probe(dev, ret, "failed to get usb-ddr path\n");
 	}
 
 	qcom->icc_path_apps = of_icc_get(dev, "apps-usb");
 	if (IS_ERR(qcom->icc_path_apps)) {
-		ret = dev_err_probe(dev, PTR_ERR(qcom->icc_path_apps),
-				    "failed to get apps-usb path\n");
+		ret = PTR_ERR(qcom->icc_path_apps);
+		qcom->icc_path_apps = NULL;
+		ret = dev_err_probe(dev, ret, "failed to get apps-usb path\n");
 		goto put_path_ddr;
 	}
 
@@ -283,8 +300,10 @@ static int dwc3_qcom_interconnect_init(struct dwc3_qcom *qcom)
 
 put_path_apps:
 	icc_put(qcom->icc_path_apps);
+	qcom->icc_path_apps = NULL;
 put_path_ddr:
 	icc_put(qcom->icc_path_ddr);
+	qcom->icc_path_ddr = NULL;
 	return ret;
 }
 
@@ -296,8 +315,12 @@ put_path_ddr:
  */
 static void dwc3_qcom_interconnect_exit(struct dwc3_qcom *qcom)
 {
-	icc_put(qcom->icc_path_ddr);
-	icc_put(qcom->icc_path_apps);
+	if (!IS_ERR_OR_NULL(qcom->icc_path_ddr))
+		icc_put(qcom->icc_path_ddr);
+	if (!IS_ERR_OR_NULL(qcom->icc_path_apps))
+		icc_put(qcom->icc_path_apps);
+	qcom->icc_path_ddr = NULL;
+	qcom->icc_path_apps = NULL;
 }
 
 /* Only usable in contexts where the role can not change. */
@@ -657,6 +680,7 @@ static int dwc3_qcom_clk_init(struct dwc3_qcom *qcom, int count)
 {
 	struct device		*dev = qcom->dev;
 	struct device_node	*np = dev->of_node;
+	extern bool		rg55g1_usb_loose_supplies;
 	int			i;
 
 	if (!np || !count)
@@ -664,6 +688,18 @@ static int dwc3_qcom_clk_init(struct dwc3_qcom *qcom, int count)
 
 	if (count < 0)
 		return count;
+
+	/*
+	 * Stock RavelinP clock cell indices do not match upstream
+	 * qcom,sm4450-gcc.h. Enabling them would vote the wrong clocks.
+	 * Bootloader already left USB clocks on for continuous splash.
+	 */
+	if (rg55g1_usb_loose_supplies) {
+		dev_warn(dev, "rg55g1: skipping stock DWC3 clocks (%d)\n", count);
+		qcom->num_clocks = 0;
+		qcom->clks = NULL;
+		return 0;
+	}
 
 	qcom->num_clocks = count;
 
@@ -752,6 +788,16 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 				     "failed to get resets\n");
 	}
 
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		/* Stock reset indices ≠ upstream (would hit wrong BCRs). */
+		if (rg55g1_usb_loose_supplies) {
+			dev_warn(dev, "rg55g1: skipping stock DWC3 resets\n");
+			qcom->resets = NULL;
+		}
+	}
+
 	ret = reset_control_assert(qcom->resets);
 	if (ret) {
 		dev_err(&pdev->dev, "failed to assert resets, err=%d\n", ret);
@@ -772,10 +818,36 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 		goto reset_assert;
 	}
 
-	qcom->qscratch_base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(qcom->qscratch_base)) {
-		ret = PTR_ERR(qcom->qscratch_base);
-		goto clk_disable;
+	{
+		struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+
+		/*
+		 * Mainline DT: parent reg is qscratch only (@a6f8800, 0x400).
+		 * Stock RavelinP: parent reg is the whole USB wrapper
+		 * (@a600000, 0x100000). Mapping that with
+		 * devm_platform_ioremap_resource() claims the region and the
+		 * child snps,dwc3 probe then fails with -EBUSY. Map only
+		 * qscratch via ioremap (no request) at the usual offset.
+		 */
+		if (!r) {
+			ret = -EINVAL;
+			goto clk_disable;
+		}
+		if (resource_size(r) > SDM845_QSCRATCH_SIZE) {
+			qcom->qscratch_base = devm_ioremap(dev,
+					r->start + SDM845_QSCRATCH_BASE_OFFSET,
+					SDM845_QSCRATCH_SIZE);
+			if (!qcom->qscratch_base) {
+				ret = -ENOMEM;
+				goto clk_disable;
+			}
+		} else {
+			qcom->qscratch_base = devm_ioremap_resource(dev, r);
+			if (IS_ERR(qcom->qscratch_base)) {
+				ret = PTR_ERR(qcom->qscratch_base);
+				goto clk_disable;
+			}
+		}
 	}
 
 	ret = dwc3_qcom_setup_irq(pdev);
@@ -790,8 +862,28 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	 */
 	ignore_pipe_clk = device_property_read_bool(dev,
 				"qcom,select-utmi-as-pipe-clk");
-	if (ignore_pipe_clk)
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		/*
+		 * No SS PHY on bring-up: without UTMI-as-PIPE, xHCI waits
+		 * forever for pipe clk and fails with -ETIMEDOUT (-110).
+		 */
+		if (rg55g1_usb_loose_supplies)
+			ignore_pipe_clk = true;
+	}
+	if (ignore_pipe_clk) {
+		dev_warn(dev, "rg55g1: selecting UTMI as PIPE clk\n");
 		dwc3_qcom_select_utmi_clk(qcom);
+		pr_emerg("rg55g1: qscratch GENERAL_CFG=0x%08x\n",
+			 readl(qcom->qscratch_base + QSCRATCH_GENERAL_CFG));
+	}
+
+	/*
+	 * Force sessvld before the core/xhci probe so the controller leaves
+	 * peripheral/OTG wait states.
+	 */
+	dwc3_qcom_vbus_override_enable(qcom, true);
 
 	ret = dwc3_qcom_of_register_core(pdev);
 	if (ret) {
@@ -799,15 +891,46 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 		goto clk_disable;
 	}
 
+	/* Core init may have touched GCTL; keep UTMI pipe mux selected. */
+	if (ignore_pipe_clk)
+		dwc3_qcom_select_utmi_clk(qcom);
+
 	ret = dwc3_qcom_interconnect_init(qcom);
 	if (ret)
 		goto depopulate;
 
 	qcom->mode = usb_get_dr_mode(&qcom->dwc3->dev);
 
-	/* enable vbus override for device mode */
-	if (qcom->mode != USB_DR_MODE_HOST)
-		dwc3_qcom_vbus_override_enable(qcom, true);
+	/*
+	 * RG55G1: PMIC sources VBUS; keep sessvld override so the core sees a
+	 * live bus. Also force UTMI_CLK_EN (bit21) and clear USB2_SUSPEND
+	 * (bit23) — without UTMI clock, PORTSC.CCS stays 0 forever.
+	 */
+	{
+		extern bool rg55g1_usb_loose_supplies;
+		u32 hs;
+
+		if (rg55g1_usb_loose_supplies) {
+			dwc3_qcom_vbus_override_enable(qcom, true);
+			hs = readl(qcom->qscratch_base + QSCRATCH_HS_PHY_CTRL);
+			hs |= BIT(21);		/* UTMI_CLK_EN */
+			hs &= ~BIT(23);		/* USB2_SUSPEND */
+			writel(hs, qcom->qscratch_base + QSCRATCH_HS_PHY_CTRL);
+			readl(qcom->qscratch_base + QSCRATCH_HS_PHY_CTRL);
+		} else if (qcom->mode != USB_DR_MODE_HOST) {
+			dwc3_qcom_vbus_override_enable(qcom, true);
+		} else {
+			dwc3_qcom_vbus_override_enable(qcom, false);
+		}
+	}
+
+	{
+		u32 hs = readl(qcom->qscratch_base + QSCRATCH_HS_PHY_CTRL);
+
+		pr_emerg("rg55g1: mode=%d HS_PHY_CTRL=0x%08x (vbus_ov=%d)\n",
+			 qcom->mode, hs,
+			 !!(hs & (UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL)));
+	}
 
 	/* register extcon to override sw_vbus on Vbus change later */
 	ret = dwc3_qcom_register_extcon(qcom);
@@ -822,6 +945,14 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
 	pm_runtime_forbid(dev);
+
+	{
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		pr_emerg("rg55g1: dwc3-qcom-legacy probe OK (%pOF)\n",
+			 dev->of_node);
+		rg55g1_status("DWC3-OK", 0x0000ff00);
+	}
 
 	return 0;
 
@@ -931,7 +1062,11 @@ static struct platform_driver dwc3_qcom_driver = {
 	},
 };
 
-module_platform_driver(dwc3_qcom_driver);
+static int __init dwc3_qcom_driver_init(void)
+{
+	return platform_driver_register(&dwc3_qcom_driver);
+}
+arch_initcall(dwc3_qcom_driver_init);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("DesignWare DWC3 QCOM legacy glue Driver");

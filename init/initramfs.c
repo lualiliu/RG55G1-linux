@@ -716,15 +716,48 @@ static void __init populate_initrd_image(char *err)
 }
 #endif /* CONFIG_BLK_DEV_RAM */
 
+static bool initramfs_unpacked;
+static async_cookie_t initramfs_cookie;
+
 static void __init do_populate_rootfs(void *unused, async_cookie_t cookie)
 {
+	extern bool rg55g1_block_deferred;
+	extern void rg55g1_status(const char *msg, u32 color);
+	char *err;
+	int saved_loglevel = console_loglevel;
+
+	rg55g1_status("UNPACK", 0x00ffff00);
+
+	/*
+	 * Quiet console during unpack — fbcon flush on this panel can wedge
+	 * mid-cpio and leave us stuck after the orange "unpack start" bar.
+	 */
+	console_loglevel = CONSOLE_LOGLEVEL_SILENT;
+
 	/* Load the built in initramfs */
-	char *err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
+	err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
+	console_loglevel = saved_loglevel;
+	rg55g1_status("UNPACK-RET", 0x00ff8800);
 	if (err)
 		panic_show_mem("%s", err); /* Failed to decompress INTERNAL initramfs */
 
-	if (!initrd_start || IS_ENABLED(CONFIG_INITRAMFS_FORCE))
+	/*
+	 * RG55G1: bootloader initrd unpack hangs. Busybox is embedded;
+	 * ignore external initrd (also CONFIG_INITRAMFS_FORCE).
+	 */
+	if (rg55g1_block_deferred || IS_ENABLED(CONFIG_INITRAMFS_FORCE)) {
+		initrd_start = 0;
+		initrd_end = 0;
+		pr_emerg("rg55g1: embedded initramfs only (skip external initrd)\n");
+		rg55g1_status("SKIP-RD", 0x0000ffff);
 		goto done;
+	}
+
+	if (!initrd_start)
+		goto done;
+
+	rg55g1_status("EXT-RD", 0x00ff00ff);
+	console_loglevel = CONSOLE_LOGLEVEL_SILENT;
 
 	if (IS_ENABLED(CONFIG_BLK_DEV_RAM))
 		printk(KERN_INFO "Trying to unpack rootfs image as initramfs...\n");
@@ -732,6 +765,7 @@ static void __init do_populate_rootfs(void *unused, async_cookie_t cookie)
 		printk(KERN_INFO "Unpacking initramfs...\n");
 
 	err = unpack_to_rootfs((char *)initrd_start, initrd_end - initrd_start);
+	console_loglevel = saved_loglevel;
 	if (err) {
 #ifdef CONFIG_BLK_DEV_RAM
 		populate_initrd_image(err);
@@ -741,7 +775,10 @@ static void __init do_populate_rootfs(void *unused, async_cookie_t cookie)
 	}
 
 done:
-	security_initramfs_populated();
+	console_loglevel = saved_loglevel;
+	rg55g1_status("POPULATE-OK", 0x0000ff00);
+	if (!rg55g1_block_deferred)
+		security_initramfs_populated();
 
 	/*
 	 * If the initrd region is overlapped with crashkernel reserved region,
@@ -759,13 +796,29 @@ done:
 	initrd_end = 0;
 
 	init_flush_fput();
+	initramfs_unpacked = true;
+}
+
+/* RG55G1: unpack without running hang-prone fs/device/late initcalls. */
+void __init rg55g1_force_populate_rootfs(void)
+{
+	extern void rg55g1_status(const char *msg, u32 color);
+
+	rg55g1_status("FORCE-RD", 0x00ff8000);
+	do_populate_rootfs(NULL, 0);
+	initramfs_unpacked = true;
+	initramfs_cookie = 1;
+	usermodehelper_enable();
+	rg55g1_status("FORCE-OK", 0x0000ff00);
 }
 
 static ASYNC_DOMAIN_EXCLUSIVE(initramfs_domain);
-static async_cookie_t initramfs_cookie;
 
 void wait_for_initramfs(void)
 {
+	if (initramfs_unpacked)
+		return;
+
 	if (!initramfs_cookie) {
 		/*
 		 * Something before rootfs_initcall wants to access
@@ -782,6 +835,26 @@ EXPORT_SYMBOL_GPL(wait_for_initramfs);
 
 static int __init populate_rootfs(void)
 {
+	extern bool rg55g1_block_deferred;
+
+	/*
+	 * RG55G1: async unpack + wait_for_initramfs wedges (last screen
+	 * mark was magenta after do_basic_setup). Unpack synchronously.
+	 */
+	if (rg55g1_block_deferred) {
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		rg55g1_status("SYNC-RD", 0x00ff8000);
+		pr_emerg("rg55g1: sync initramfs unpack\n");
+		do_populate_rootfs(NULL, 0);
+		initramfs_unpacked = true;
+		initramfs_cookie = 1; /* non-zero: wait_for_initramfs no-ops via flag */
+		rg55g1_status("SYNC-OK", 0x0000ff00);
+		usermodehelper_enable();
+		pr_emerg("rg55g1: sync initramfs done\n");
+		return 0;
+	}
+
 	initramfs_cookie = async_schedule_domain(do_populate_rootfs, NULL,
 						 &initramfs_domain);
 	usermodehelper_enable();

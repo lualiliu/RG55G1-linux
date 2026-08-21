@@ -10,6 +10,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/driver.h>
+#include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/regmap.h>
 
@@ -68,6 +69,17 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 	if (!init_data)
 		return -ENOMEM;
 
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		if (rg55g1_usb_loose_supplies) {
+			init_data->constraints.always_on = 1;
+			init_data->constraints.boot_on = 1;
+			init_data->constraints.valid_ops_mask |=
+				REGULATOR_CHANGE_STATUS;
+		}
+	}
+
 	qcom_usb_vbus_rdesc.enable_reg = base + CMD_OTG;
 	qcom_usb_vbus_rdesc.enable_mask = OTG_EN;
 	qcom_usb_vbus_rdesc.csel_reg = base + OTG_CURRENT_LIMIT_CFG;
@@ -87,11 +99,19 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 	/* Disable HW logic for VBUS enable */
 	regmap_update_bits(regmap, base + OTG_CFG, OTG_EN_SRC_CFG, 0);
 
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		if (rg55g1_usb_loose_supplies)
+			dev_warn(dev, "rg55g1: usb_vbus registered (always-on)\n");
+	}
+
 	return 0;
 }
 
 static const struct of_device_id qcom_usb_vbus_regulator_match[] = {
 	{ .compatible = "qcom,pm8150b-vbus-reg" },
+	{ .compatible = "qcom,pm7250b-vbus-reg" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, qcom_usb_vbus_regulator_match);
@@ -104,7 +124,12 @@ static struct platform_driver qcom_usb_vbus_regulator_driver = {
 	},
 	.probe		= qcom_usb_vbus_regulator_probe,
 };
-module_platform_driver(qcom_usb_vbus_regulator_driver);
+
+static int __init qcom_usb_vbus_regulator_init(void)
+{
+	return platform_driver_register(&qcom_usb_vbus_regulator_driver);
+}
+arch_initcall(qcom_usb_vbus_regulator_init); /* RG55G1 */
 
 MODULE_DESCRIPTION("Qualcomm USB vbus regulator driver");
 MODULE_LICENSE("GPL v2");

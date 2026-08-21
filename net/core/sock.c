@@ -4455,7 +4455,7 @@ static int __init proto_init(void)
 	return register_pernet_subsys(&proto_net_ops);
 }
 
-subsys_initcall(proto_init);
+arch_initcall(proto_init); /* RG55G1: before net_dev_init, skip full subsys */
 
 #endif /* PROC_FS */
 

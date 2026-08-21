@@ -428,6 +428,8 @@ void xhci_ring_cmd_db(struct xhci_hcd *xhci)
 
 	trace_xhci_ring_host_doorbell(0, DB_VALUE_HOST);
 
+	/* Ensure TRB stores are visible to the HC before doorbell. */
+	wmb();
 	writel(DB_VALUE_HOST, &xhci->dba->doorbell[0]);
 	/* Flush PCI posted writes */
 	readl(&xhci->dba->doorbell[0]);
@@ -1839,9 +1841,30 @@ static void handle_cmd_completion(struct xhci_hcd *xhci,
 	cancel_delayed_work(&xhci->cmd_timer);
 
 	if (cmd->command_trb != xhci->cmd_ring->dequeue) {
-		xhci_err(xhci,
-			 "Command completion event does not match command\n");
-		return;
+		extern bool rg55g1_usb_loose_supplies;
+		u32 dq_type = TRB_FIELD_TO_TYPE(
+			le32_to_cpu(cmd_trb->generic.field[3]));
+		u32 exp_type = cmd->command_trb ?
+			TRB_FIELD_TO_TYPE(le32_to_cpu(
+				cmd->command_trb->generic.field[3])) : 0;
+
+		pr_emerg("rg55g1: cmd ptr mismatch deq=%px cmd_trb=%px dq_type=%u exp=%u comp=%u dma=0x%llx\n",
+			 xhci->cmd_ring->dequeue, cmd->command_trb,
+			 dq_type, exp_type, cmd_comp_code,
+			 (unsigned long long)cmd_dma);
+
+		/*
+		 * Event DMA already matched dequeue. Trust HW: the TRB at
+		 * dequeue is what completed. Rebind the pending command.
+		 */
+		if (rg55g1_usb_loose_supplies &&
+		    (!cmd->command_trb || dq_type == exp_type)) {
+			cmd->command_trb = xhci->cmd_ring->dequeue;
+		} else {
+			xhci_err(xhci,
+				 "Command completion event does not match command\n");
+			return;
+		}
 	}
 
 	/*
@@ -3088,28 +3111,45 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
 	}
 
 	/* Process all OS owned event TRBs on this event ring */
-	while (unhandled_event_trb(ir->event_ring)) {
-		if (!skip_events)
-			err = xhci_handle_event_trb(xhci, ir, ir->event_ring->dequeue);
+	{
+		extern bool rg55g1_usb_loose_supplies;
+		int total = 0;
+		int max_events = rg55g1_usb_loose_supplies ?
+			TRBS_PER_SEGMENT : (TRBS_PER_SEGMENT * 4);
 
-		/*
-		 * If half a segment of events have been handled in one go then
-		 * update ERDP, and force isoc trbs to interrupt more often
-		 */
-		if (event_loop++ > TRBS_PER_SEGMENT / 2) {
-			xhci_update_erst_dequeue(xhci, ir, false);
+		while (unhandled_event_trb(ir->event_ring)) {
+			if (!skip_events)
+				err = xhci_handle_event_trb(xhci, ir,
+							    ir->event_ring->dequeue);
 
-			if (ir->isoc_bei_interval > AVOID_BEI_INTERVAL_MIN)
-				ir->isoc_bei_interval = ir->isoc_bei_interval / 2;
+			/*
+			 * If half a segment of events have been handled in one go then
+			 * update ERDP, and force isoc trbs to interrupt more often
+			 */
+			if (event_loop++ > TRBS_PER_SEGMENT / 2) {
+				xhci_update_erst_dequeue(xhci, ir, false);
 
-			event_loop = 0;
+				if (ir->isoc_bei_interval > AVOID_BEI_INTERVAL_MIN)
+					ir->isoc_bei_interval =
+						ir->isoc_bei_interval / 2;
+
+				event_loop = 0;
+			}
+
+			/* Update SW event ring dequeue pointer */
+			inc_deq(xhci, ir->event_ring);
+
+			if (err)
+				break;
+
+			/*
+			 * RG55G1: bypass/non-coherent DMA can make cycle bits look
+			 * permanently owned → infinite spin under xhci->lock when
+			 * charger then keyboard plugs in.
+			 */
+			if (++total >= max_events)
+				break;
 		}
-
-		/* Update SW event ring dequeue pointer */
-		inc_deq(xhci, ir->event_ring);
-
-		if (err)
-			break;
 	}
 
 	xhci_update_erst_dequeue(xhci, ir, true);
@@ -3158,6 +3198,7 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd)
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	irqreturn_t ret = IRQ_HANDLED;
 	u32 status;
+	extern bool rg55g1_usb_loose_supplies;
 
 	spin_lock(&xhci->lock);
 	/* Check if the xHC generated the interrupt, or the irq is shared */
@@ -3168,7 +3209,19 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd)
 	}
 
 	if (!(status & STS_EINT)) {
-		ret = IRQ_NONE;
+		/*
+		 * RG55G1: GIC may swallow IRQs and/or IE/INTE leave STS_EINT
+		 * clear while Command Completion events already sit on the
+		 * event ring. Always drain interrupter 0 so ENABLE_SLOT can
+		 * complete (otherwise cmd_timer aborts with COMP_COMMAND_ABORTED=25).
+		 */
+		if (rg55g1_usb_loose_supplies && xhci->interrupters &&
+		    xhci->interrupters[0]) {
+			xhci_handle_events(xhci, xhci->interrupters[0], false);
+			ret = IRQ_HANDLED;
+		} else {
+			ret = IRQ_NONE;
+		}
 		goto out;
 	}
 

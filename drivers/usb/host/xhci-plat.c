@@ -10,6 +10,7 @@
 
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/of.h>
@@ -21,12 +22,203 @@
 #include <linux/usb/of.h>
 #include <linux/reset.h>
 #include <linux/usb/xhci-sideband.h>
+#include <linux/workqueue.h>
 
 #include "xhci.h"
 #include "xhci-plat.h"
 #include "xhci-mvebu.h"
 
 static struct hc_driver __read_mostly xhci_plat_hc_driver;
+
+/* RG55G1: poll root-hub PORTSC when GIC events may be silent. */
+struct rg55g1_xhci_poll {
+	struct delayed_work work;
+	struct xhci_hcd *xhci;
+	u32 last_u2;
+	u32 last_u3;
+	u32 ticks;
+	bool did_reset;
+};
+
+/* PORTSC RW1C change bits — writing 1 clears; must mask when setting PP. */
+#define RG55_PORT_RWC	PORT_CHANGE_MASK
+
+static void rg55g1_xhci_poll_fn(struct work_struct *work)
+{
+	struct rg55g1_xhci_poll *p =
+		container_of(to_delayed_work(work), struct rg55g1_xhci_poll, work);
+	struct xhci_hcd *xhci = p->xhci;
+	struct usb_hcd *hcd;
+	u32 u2 = 0, u3 = 0;
+	char msg[48];
+	extern void rg55g1_status(const char *msg, u32 color);
+	extern bool rg55g1_usb_loose_supplies;
+
+	if (!rg55g1_usb_loose_supplies || !xhci)
+		return;
+
+	hcd = xhci->main_hcd;
+	p->ticks++;
+
+	/*
+	 * Drain event ring even if GIC delivery is silent — STS_EINT still
+	 * latches, and without this URBs/HID never complete.
+	 */
+	if (hcd)
+		(void)xhci_irq(hcd);
+
+	/*
+	 * Keep GUSB2PHYCFG.SUSPHY/ENBLSLPM clear, UTMI clock on, VBUS override
+	 * on (PMIC boost). Rotate a short register dump so we can see why CCS
+	 * stays 0.
+	 */
+	{
+		static void __iomem *dwc_regs;
+		static void __iomem *qscratch;
+		static void __iomem *hsphy;
+		static void __iomem *eud;
+		u32 cfg = 0, hs = 0, utmi = 0, ecsr = 0;
+
+		if (!dwc_regs)
+			dwc_regs = ioremap(0x0a600000, 0xd800);
+		if (!qscratch)
+			qscratch = ioremap(0x0a6f8800, 0x400);
+		if (!hsphy)
+			hsphy = ioremap(0x088e3000, 0x200);
+		if (!eud)
+			eud = ioremap(0x088e0000, 0x2000);
+
+		if (dwc_regs) {
+			cfg = readl(dwc_regs + 0xc200); /* GUSB2PHYCFG(0) */
+			if (cfg & (BIT(6) | BIT(8))) {
+				cfg &= ~(BIT(6) | BIT(8));
+				writel(cfg, dwc_regs + 0xc200);
+				cfg = readl(dwc_regs + 0xc200);
+			}
+		}
+		if (qscratch) {
+			hs = readl(qscratch + 0x10); /* HS_PHY_CTRL */
+			hs |= BIT(20) | BIT(28) | BIT(21); /* VBUS + UTMI_CLK_EN */
+			hs &= ~BIT(23);			   /* !USB2_SUSPEND */
+			writel(hs, qscratch + 0x10);
+			hs = readl(qscratch + 0x10);
+		}
+		if (hsphy) {
+			u32 c0, c2;
+			static void __iomem *gcc;
+			static bool phy_kicked;
+
+			if (!gcc)
+				gcc = ioremap(0x00100000, 0xa0000);
+			if (gcc && !phy_kicked) {
+				writel(1, gcc + 0x9c00c);
+				writel(1, gcc + 0x9c010);
+				writel(0, gcc + 0x22000); /* QUSB2PHY BCR deassert */
+				phy_kicked = true;
+			}
+
+			utmi = readl(hsphy + 0x3c);
+			c0 = readl(hsphy + 0x54);
+			if (!(utmi & BIT(0)) || (c0 & BIT(2))) {
+				writel(c0 & ~BIT(2), hsphy + 0x54);
+				c2 = readl(hsphy + 0x64);
+				writel(c2 | BIT(2) | BIT(3), hsphy + 0x64);
+				writel(BIT(0), hsphy + 0x3c); /* SLEEPM */
+				utmi = readl(hsphy + 0x3c);
+				c0 = readl(hsphy + 0x54);
+			}
+			/* status: COMMON0 in high 16, UTMI in low 16 */
+			utmi = ((c0 & 0xffff) << 16) | (utmi & 0xffff);
+		}
+		if (eud)
+			ecsr = readl(eud + 0x1014); /* CSR_EUD_EN */
+
+		if (hcd && xhci->usb2_rhub.ports && xhci->usb2_rhub.num_ports) {
+			struct xhci_port *port = xhci->usb2_rhub.ports[0];
+			u32 pls;
+			bool was_conn = !!(p->last_u2 & PORT_CONNECT);
+
+			u2 = xhci_portsc_readl(port);
+			pls = u2 & PORT_PLS_MASK;
+
+			if (!(u2 & PORT_POWER)) {
+				u32 tmp = xhci_port_state_to_neutral(u2) |
+					  PORT_POWER;
+
+				xhci_portsc_writel(port, tmp);
+				u2 = xhci_portsc_readl(port);
+				pls = u2 & PORT_PLS_MASK;
+			}
+
+			/* Unplug: re-arm one-shot reset for next plug. */
+			if (was_conn && !(u2 & PORT_CONNECT))
+				p->did_reset = false;
+
+			/*
+			 * Only poke link state when nothing is attached.
+			 * Charger/SDP then keyboard: rewriting PORTSC while
+			 * CCS=1 races hub reset and hard-locks the host.
+			 */
+			if (!(u2 & PORT_CONNECT)) {
+				if ((u2 & PORT_POWER) &&
+				    (pls == XDEV_DISABLED ||
+				     pls == XDEV_INACTIVE ||
+				     pls == XDEV_COMP_MODE)) {
+					u32 tmp = xhci_port_state_to_neutral(u2);
+
+					tmp &= ~PORT_PLS_MASK;
+					tmp |= PORT_POWER | PORT_LINK_STROBE |
+					       XDEV_RXDETECT;
+					xhci_portsc_writel(port, tmp);
+					u2 = xhci_portsc_readl(port);
+				}
+
+				if (!p->did_reset && (u2 & PORT_POWER) &&
+				    (p->ticks == 15 ||
+				     (p->ticks > 15 && (p->ticks % 100) == 0))) {
+					u32 tmp = xhci_port_state_to_neutral(u2) |
+						  PORT_POWER | PORT_RESET;
+
+					xhci_portsc_writel(port, tmp);
+					p->did_reset = true;
+					u2 = xhci_portsc_readl(port);
+				}
+			}
+
+			set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+			usb_hcd_poll_rh_status(hcd);
+		}
+		if (xhci->shared_hcd && xhci->usb3_rhub.ports &&
+		    xhci->usb3_rhub.num_ports) {
+			u3 = xhci_portsc_readl(xhci->usb3_rhub.ports[0]);
+			set_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
+			usb_hcd_poll_rh_status(xhci->shared_hcd);
+		}
+
+		/* Rotate: U2 portsc / HS_PHY_CTRL+GUSB2 / EUD+UTMI */
+		switch (p->ticks % 3) {
+		case 0:
+			snprintf(msg, sizeof(msg), "U2:c%dp%de%dL%x %08x",
+				 !!(u2 & PORT_CONNECT),
+				 !!(u2 & PORT_POWER),
+				 !!(u2 & PORT_PE),
+				 (u2 & PORT_PLS_MASK) >> 5,
+				 u2);
+			break;
+		case 1:
+			snprintf(msg, sizeof(msg), "H%08x G%08x", hs, cfg);
+			break;
+		default:
+			snprintf(msg, sizeof(msg), "E%08x P%08x", ecsr, utmi);
+			break;
+		}
+		rg55g1_status(msg, (u2 & PORT_CONNECT) ? 0x0000ff00 : 0x00ffff00);
+		p->last_u2 = u2;
+		p->last_u3 = u3;
+	}
+
+	schedule_delayed_work(&p->work, msecs_to_jiffies(200));
+}
 
 static int xhci_plat_setup(struct usb_hcd *hcd);
 static int xhci_plat_start(struct usb_hcd *hcd);
@@ -177,9 +369,21 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	if (!sysdev)
 		sysdev = &pdev->dev;
 
-	ret = dma_set_mask_and_coherent(sysdev, DMA_BIT_MASK(64));
-	if (ret)
-		return ret;
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		/*
+		 * RG55G1: CRCR stays CMD_RING_RUNNING with no completions when
+		 * cmd/event rings land above 4GB (USB DMA path is effectively
+		 * 32-bit). Force 32-bit DMA before any ring allocation.
+		 */
+		if (rg55g1_usb_loose_supplies)
+			ret = dma_set_mask_and_coherent(sysdev, DMA_BIT_MASK(32));
+		else
+			ret = dma_set_mask_and_coherent(sysdev, DMA_BIT_MASK(64));
+		if (ret)
+			return ret;
+	}
 
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_use_autosuspend(&pdev->dev);
@@ -205,6 +409,15 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	xhci = hcd_to_xhci(hcd);
 
 	xhci->allow_single_roothub = 1;
+
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		if (rg55g1_usb_loose_supplies) {
+			xhci->quirks |= XHCI_NO_64BIT_SUPPORT;
+			pr_emerg("rg55g1: xhci force 32-bit DMA / NO_64BIT\n");
+		}
+	}
 
 	/*
 	 * Not all platforms have clks so it is not an error if the
@@ -311,6 +524,19 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	if (priv && (priv->quirks & XHCI_SG_TRB_CACHE_SIZE_QUIRK))
 		xhci->quirks |= XHCI_SG_TRB_CACHE_SIZE_QUIRK;
 
+	{
+		u32 cap, usbsts;
+		void __iomem *base = hcd->regs;
+		u8 cap_len;
+
+		cap = readl(base);
+		cap_len = cap & 0xff;
+		usbsts = (cap_len >= 0x20 && cap_len < 0xe0) ?
+			 readl(base + cap_len + 0x04) : 0xdeadbeef;
+		pr_emerg("rg55g1: xhci pre-add CAP=0x%08x USBSTS=0x%08x\n",
+			 cap, usbsts);
+	}
+
 	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
 	if (ret)
 		goto disable_usb_phy;
@@ -360,6 +586,37 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	 * runtime pm using power/control in sysfs.
 	 */
 	pm_runtime_forbid(&pdev->dev);
+
+	{
+		extern void rg55g1_status(const char *msg, u32 color);
+		extern bool rg55g1_usb_loose_supplies;
+
+		pr_emerg("rg55g1: xhci_plat_probe OK irq=%d\n", irq);
+		rg55g1_status("XHCI-OK", 0x0000ff00);
+
+		if (rg55g1_usb_loose_supplies) {
+			struct rg55g1_xhci_poll *poll;
+
+			set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+			if (xhci->shared_hcd)
+				set_bit(HCD_FLAG_POLL_RH,
+					&xhci->shared_hcd->flags);
+			/*
+			 * Do NOT poll/enumerate synchronously here — that can
+			 * run ENABLE_SLOT on the probe path and stall boot.
+			 * Delayed work will kick hub + drain events.
+			 */
+			poll = devm_kzalloc(&pdev->dev, sizeof(*poll),
+					    GFP_KERNEL);
+			if (poll) {
+				poll->xhci = xhci;
+				INIT_DELAYED_WORK(&poll->work,
+						  rg55g1_xhci_poll_fn);
+				schedule_delayed_work(&poll->work,
+						      msecs_to_jiffies(100));
+			}
+		}
+	}
 
 	return 0;
 
@@ -418,8 +675,12 @@ static int xhci_generic_plat_probe(struct platform_device *pdev)
 		sysdev = &pdev->dev;
 
 	if (WARN_ON(!sysdev->dma_mask)) {
+		extern bool rg55g1_usb_loose_supplies;
+
 		/* Platform did not initialize dma_mask */
-		ret = dma_coerce_mask_and_coherent(sysdev, DMA_BIT_MASK(64));
+		ret = dma_coerce_mask_and_coherent(sysdev,
+			rg55g1_usb_loose_supplies ? DMA_BIT_MASK(32)
+						  : DMA_BIT_MASK(64));
 		if (ret)
 			return ret;
 	}
@@ -646,7 +907,7 @@ static int __init xhci_plat_init(void)
 	xhci_init_driver(&xhci_plat_hc_driver, &xhci_plat_overrides);
 	return platform_driver_register(&usb_generic_xhci_driver);
 }
-module_init(xhci_plat_init);
+arch_initcall(xhci_plat_init); /* RG55G1: host controller without full LV6 */
 
 static void __exit xhci_plat_exit(void)
 {

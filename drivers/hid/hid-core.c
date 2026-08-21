@@ -3218,7 +3218,7 @@ static void __exit hid_exit(void)
 	hid_quirks_exit(HID_BUS_ANY);
 }
 
-module_init(hid_init);
+arch_initcall(hid_init); /* RG55G1: HID bus without full LV6 */
 module_exit(hid_exit);
 
 MODULE_AUTHOR("Andreas Gal");

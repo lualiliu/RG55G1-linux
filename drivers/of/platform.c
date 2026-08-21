@@ -502,6 +502,19 @@ static const struct of_device_id reserved_mem_matches[] = {
 static int __init of_platform_default_populate_init(void)
 {
 	struct device_node *node, *reserved;
+	extern bool rg55g1_skip_of_populate;
+
+	/*
+	 * RG55G1 bring-up: stock DT / dtbo of_platform hangs before /init.
+	 * Splash FB is already registered; skip creating platform devices.
+	 */
+	if (rg55g1_skip_of_populate) {
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		pr_emerg("rg55g1: skip of_platform_default_populate\n");
+		rg55g1_status("SKIP-OF", 0x00ff8000);
+		return 0;
+	}
 
 	device_links_supplier_sync_state_pause();
 
@@ -607,6 +620,10 @@ arch_initcall_sync(of_platform_default_populate_init);
 
 static int __init of_platform_sync_state_init(void)
 {
+	extern bool rg55g1_skip_of_populate;
+
+	if (rg55g1_skip_of_populate)
+		return 0;
 	device_links_supplier_sync_state_resume();
 	return 0;
 }

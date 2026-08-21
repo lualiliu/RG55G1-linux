@@ -445,7 +445,7 @@ static void __exit usb_common_exit(void)
 	debugfs_remove_recursive(usb_debug_root);
 }
 
-subsys_initcall(usb_common_init);
+arch_initcall(usb_common_init); /* RG55G1: avoid hang-prone full subsys level */
 module_exit(usb_common_exit);
 
 MODULE_DESCRIPTION("Common code for host and device side USB");

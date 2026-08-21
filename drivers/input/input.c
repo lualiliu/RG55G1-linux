@@ -2769,5 +2769,6 @@ static void __exit input_exit(void)
 	class_unregister(&input_class);
 }
 
-subsys_initcall(input_init);
+/* Before arch_initcall(chr_dev_init) so kbd_init can register. */
+postcore_initcall(input_init);
 module_exit(input_exit);

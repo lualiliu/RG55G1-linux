@@ -1438,7 +1438,8 @@ static void __exit evdev_exit(void)
 	input_unregister_handler(&evdev_handler);
 }
 
-module_init(evdev_init);
+/* RG55G1: device_initcall skipped — need /dev/input/event* for HID. */
+arch_initcall(evdev_init);
 module_exit(evdev_exit);
 
 MODULE_AUTHOR("Vojtech Pavlik <vojtech@ucw.cz>");

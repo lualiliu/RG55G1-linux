@@ -9,6 +9,7 @@
  */
 
 #include <linux/jiffies.h>
+#include <linux/delay.h>
 #include <linux/pci.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
@@ -31,6 +32,41 @@
 #define DRIVER_DESC "'eXtensible' Host Controller (xHC) Driver"
 
 #define	PORT_WAKE_BITS	(PORT_WKOC_E | PORT_WKDISC_E | PORT_WKCONN_E)
+
+/*
+ * RG55G1: GIC may not deliver xHCI IRQs. Drain the event ring while waiting
+ * for command completion so ENABLE_SLOT / Address Device can finish.
+ */
+static void xhci_rg55_wait_cmd(struct xhci_hcd *xhci,
+			       struct completion *completion)
+{
+	extern bool rg55g1_usb_loose_supplies;
+	struct usb_hcd *hcd = xhci_to_hcd(xhci);
+	unsigned long deadline;
+	int n = 0;
+
+	if (!rg55g1_usb_loose_supplies) {
+		wait_for_completion(completion);
+		return;
+	}
+
+	/*
+	 * Drain a few times then sleep on the completion. Busy-spinning
+	 * xhci_irq() under contention with the poll worker hard-locks on
+	 * charger→keyboard plug sequences.
+	 */
+	deadline = jiffies + msecs_to_jiffies(3000);
+	while (!completion_done(completion) && time_before(jiffies, deadline)) {
+		if (n++ < 32) {
+			xhci_irq(hcd);
+			if (xhci->shared_hcd)
+				xhci_irq(xhci->shared_hcd);
+		}
+		usleep_range(1000, 2000);
+	}
+	if (!completion_done(completion))
+		wait_for_completion_timeout(completion, msecs_to_jiffies(2000));
+}
 
 /* Some 0.95 hardware can't handle the chain bit on a Link TRB being cleared */
 static int link_quirk;
@@ -190,6 +226,30 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
 		if (!(xhci->xhc_state & XHCI_STATE_DYING))
 			xhci_warn(xhci, "Host not accessible, reset failed.\n");
 		return -ENODEV;
+	}
+
+	/*
+	 * RG55G1: controller is already HALTed with CNR clear (bootloader /
+	 * DWC3 left it ready). Issuing CMD_RESET then hangs forever waiting
+	 * for CNR (usb_add_hcd → -ETIMEDOUT / -110). Skip the reset and let
+	 * xhci_init reprogram rings from scratch.
+	 */
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		if (rg55g1_usb_loose_supplies &&
+		    (state & STS_HALT) && !(state & STS_CNR)) {
+			xhci_info(xhci,
+				  "rg55g1: skip CMD_RESET (USBSTS=0x%x already ready)\n",
+				  state);
+			xhci->usb2_rhub.bus_state.port_c_suspend = 0;
+			xhci->usb2_rhub.bus_state.suspended_ports = 0;
+			xhci->usb2_rhub.bus_state.resuming_ports = 0;
+			xhci->usb3_rhub.bus_state.port_c_suspend = 0;
+			xhci->usb3_rhub.bus_state.suspended_ports = 0;
+			xhci->usb3_rhub.bus_state.resuming_ports = 0;
+			return 0;
+		}
 	}
 
 	if ((state & STS_HALT) == 0) {
@@ -2922,7 +2982,7 @@ int xhci_stop_endpoint_sync(struct xhci_hcd *xhci, struct xhci_virt_ep *ep, int 
 	xhci_ring_cmd_db(xhci);
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
-	wait_for_completion(command->completion);
+	xhci_rg55_wait_cmd(xhci, command->completion);
 
 	/* No handling for COMP_CONTEXT_STATE_ERROR done at command completion*/
 	if (command->status == COMP_COMMAND_ABORTED ||
@@ -3027,7 +3087,7 @@ static int xhci_configure_endpoint(struct xhci_hcd *xhci,
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
 	/* Wait for the configure endpoint command to complete */
-	wait_for_completion(command->completion);
+	xhci_rg55_wait_cmd(xhci, command->completion);
 
 	if (!ctx_change)
 		ret = xhci_configure_endpoint_result(xhci, udev,
@@ -3231,7 +3291,7 @@ int xhci_get_port_bandwidth(struct xhci_hcd *xhci, struct xhci_container_ctx *ct
 	xhci_ring_cmd_db(xhci);
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
-	wait_for_completion(cmd->completion);
+	xhci_rg55_wait_cmd(xhci, cmd->completion);
 	if (cmd->status != COMP_SUCCESS)
 		ret = -EIO;
 err_out:
@@ -3412,7 +3472,7 @@ static void xhci_endpoint_reset(struct usb_hcd *hcd,
 	xhci_ring_cmd_db(xhci);
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
-	wait_for_completion(stop_cmd->completion);
+	xhci_rg55_wait_cmd(xhci, stop_cmd->completion);
 
 	spin_lock_irqsave(&xhci->lock, flags);
 
@@ -3443,7 +3503,7 @@ static void xhci_endpoint_reset(struct usb_hcd *hcd,
 	xhci_ring_cmd_db(xhci);
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
-	wait_for_completion(cfg_cmd->completion);
+	xhci_rg55_wait_cmd(xhci, cfg_cmd->completion);
 
 	xhci_free_command(xhci, cfg_cmd);
 cleanup:
@@ -4006,7 +4066,7 @@ static int xhci_discover_or_reset_device(struct usb_hcd *hcd,
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
 	/* Wait for the Reset Device command to finish */
-	wait_for_completion(reset_device_cmd->completion);
+	xhci_rg55_wait_cmd(xhci, reset_device_cmd->completion);
 
 	/* The Reset Device command can't fail, according to the 0.95/0.96 spec,
 	 * unless we tried to reset a slot ID that wasn't enabled,
@@ -4163,7 +4223,7 @@ int xhci_disable_slot(struct xhci_hcd *xhci, u32 slot_id)
 	xhci_ring_cmd_db(xhci);
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
-	wait_for_completion(command->completion);
+	xhci_rg55_wait_cmd(xhci, command->completion);
 
 	if (command->status != COMP_SUCCESS)
 		xhci_warn(xhci, "Unsuccessful disable slot %u command, status %d\n",
@@ -4235,14 +4295,42 @@ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
 	xhci_ring_cmd_db(xhci);
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
-	wait_for_completion(command->completion);
+	xhci_rg55_wait_cmd(xhci, command->completion);
 	slot_id = command->slot_id;
 
 	if (!slot_id || command->status != COMP_SUCCESS) {
+		u32 usbsts = readl(&xhci->op_regs->status);
+		u32 usbcmd = readl(&xhci->op_regs->command);
+		u64 crcr = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
+		u64 erdp = 0, dcbaa = 0;
+		dma_addr_t cmd_dma = 0, evt_dma = 0;
+
+		if (xhci->interrupters && xhci->interrupters[0] &&
+		    xhci->interrupters[0]->ir_set)
+			erdp = xhci_read_64(xhci,
+				&xhci->interrupters[0]->ir_set->erst_dequeue);
+		dcbaa = xhci_read_64(xhci, &xhci->op_regs->dcbaa_ptr);
+		if (xhci->cmd_ring)
+			cmd_dma = xhci_trb_virt_to_dma(xhci->cmd_ring->deq_seg,
+						       xhci->cmd_ring->dequeue);
+		if (xhci->interrupters && xhci->interrupters[0] &&
+		    xhci->interrupters[0]->event_ring)
+			evt_dma = xhci_trb_virt_to_dma(
+				xhci->interrupters[0]->event_ring->deq_seg,
+				xhci->interrupters[0]->event_ring->dequeue);
+
 		xhci_err(xhci, "Error while assigning device slot ID: %s\n",
 			 xhci_trb_comp_code_string(command->status));
 		xhci_err(xhci, "Max number of devices this xHCI host supports is %u.\n",
 			 xhci->max_slots);
+		pr_emerg("rg55g1: ENABLE_SLOT fail status=%u slot=%d max=%u "
+			 "USBCMD=0x%x USBSTS=0x%x CRCR=0x%llx\n",
+			 command->status, slot_id, xhci->max_slots,
+			 usbcmd, usbsts, (unsigned long long)crcr);
+		pr_emerg("rg55g1: DMA cmd=%pad evt=%pad ERDP=0x%llx DCBAA=0x%llx hcc=0x%x\n",
+			 &cmd_dma, &evt_dma,
+			 (unsigned long long)erdp, (unsigned long long)dcbaa,
+			 xhci->hcc_params);
 		xhci_free_command(xhci, command);
 		return 0;
 	}
@@ -4402,7 +4490,7 @@ static int xhci_setup_device(struct usb_hcd *hcd, struct usb_device *udev,
 	spin_unlock_irqrestore(&xhci->lock, flags);
 
 	/* ctrl tx can take up to 5 sec; XXX: need more time for xHC? */
-	wait_for_completion(command->completion);
+	xhci_rg55_wait_cmd(xhci, command->completion);
 
 	/* FIXME: From section 4.3.4: "Software shall be responsible for timing
 	 * the SetAddress() "recovery interval" required by USB and aborting the
@@ -5711,5 +5799,5 @@ static void __exit xhci_hcd_fini(void)
 	xhci_dbc_exit();
 }
 
-module_init(xhci_hcd_init);
+arch_initcall(xhci_hcd_init); /* RG55G1: before xhci-plat probe */
 module_exit(xhci_hcd_fini);

@@ -311,9 +311,12 @@ static int pmic_arb_check_chnl_status_v1(struct spmi_controller *ctrl,
 		return -EAGAIN;
 
 	if (status & BIT(1)) {
+		extern bool rg55g1_usb_loose_supplies;
+
 		dev_err(&ctrl->dev, "%s: %#x %#x: transaction failed (%#x) reg: 0x%x\n",
 			__func__, sid, addr, status, offset);
-		WARN_ON(1);
+		if (!rg55g1_usb_loose_supplies)
+			WARN_ON(1);
 		return -EIO;
 	}
 
@@ -341,9 +344,12 @@ static int pmic_arb_check_chnl_status_v8p5(struct spmi_controller *ctrl,
 		return -EAGAIN;
 
 	if (status & BIT(1)) {
+		extern bool rg55g1_usb_loose_supplies;
+
 		dev_err(&ctrl->dev, "%s: %#x %#x: transaction failed (%#x) reg: 0x%x\n",
 			__func__, sid, addr, status, offset);
-		WARN_ON(1);
+		if (!rg55g1_usb_loose_supplies)
+			WARN_ON(1);
 		return -EIO;
 	}
 
@@ -1417,8 +1423,14 @@ static int pmic_arb_offset_v5(struct spmi_pmic_arb_bus *bus, u8 sid, u16 addr,
 		break;
 	case PMIC_ARB_CHANNEL_RW:
 		if (bus->apid_data[apid].write_ee != pmic_arb->ee) {
-			dev_err(&bus->spmic->dev, "disallowed SPMI write to sid=%u, addr=0x%04X\n",
-				sid, addr);
+			/*
+			 * Do NOT steal write_ee: writing a channel owned by
+			 * another EE causes synchronous external abort on
+			 * this SoC. Charger OTG stays ADSP-owned.
+			 */
+			dev_err_ratelimited(&bus->spmic->dev,
+				"disallowed SPMI write to sid=%u, addr=0x%04X (owner EE %u)\n",
+				sid, addr, bus->apid_data[apid].write_ee);
 			return -EPERM;
 		}
 		offset = 0x10000 * apid;
@@ -1517,8 +1529,9 @@ static int pmic_arb_offset_v7(struct spmi_pmic_arb_bus *bus, u8 sid, u16 addr,
 		break;
 	case PMIC_ARB_CHANNEL_RW:
 		if (bus->apid_data[apid].write_ee != pmic_arb->ee) {
-			dev_err(&bus->spmic->dev, "disallowed SPMI write to sid=%u, addr=0x%04X\n",
-				sid, addr);
+			dev_err_ratelimited(&bus->spmic->dev,
+				"disallowed SPMI write to sid=%u, addr=0x%04X (owner EE %u)\n",
+				sid, addr, bus->apid_data[apid].write_ee);
 			return -EPERM;
 		}
 		offset = 0x1000 * apid;
@@ -1613,8 +1626,9 @@ static int pmic_arb_offset_v8(struct spmi_pmic_arb_bus *bus, u8 sid, u16 addr,
 		break;
 	case PMIC_ARB_CHANNEL_RW:
 		if (bus->apid_data[apid].write_ee != pmic_arb->ee) {
-			dev_err(&bus->spmic->dev, "disallowed SPMI write to sid=%u, addr=0x%04X\n",
-				sid, addr);
+			dev_err_ratelimited(&bus->spmic->dev,
+				"disallowed SPMI write to sid=%u, addr=0x%04X (owner EE %u)\n",
+				sid, addr, bus->apid_data[apid].write_ee);
 			return -EPERM;
 		}
 		offset = 0x200 * apid;
@@ -1998,8 +2012,21 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 		return PTR_ERR(intr);
 
 	irq = of_irq_get_byname(node, "periph_irq");
-	if (irq <= 0)
-		return irq ?: -ENXIO;
+	if (irq <= 0) {
+		extern bool rg55g1_usb_loose_supplies;
+
+		/*
+		 * Stock routes periph_irq via PDC, which we skip. Still allow
+		 * SPMI R/W so PM7250B OTG/VBUS can be enabled.
+		 */
+		if (rg55g1_usb_loose_supplies) {
+			dev_warn(dev, "rg55g1: SPMI without periph_irq (%d)\n",
+				 irq);
+			irq = 0;
+		} else {
+			return irq ?: -ENXIO;
+		}
+	}
 
 	bus->pmic_arb = pmic_arb;
 	bus->intr = intr;
@@ -2020,14 +2047,18 @@ static int spmi_pmic_arb_bus_init(struct platform_device *pdev,
 
 	dev_dbg(&pdev->dev, "adding irq domain for bus %d\n", bus_index);
 
-	bus->domain = irq_domain_create_tree(of_fwnode_handle(node), &pmic_arb_irq_domain_ops, bus);
-	if (!bus->domain) {
-		dev_err(&pdev->dev, "unable to create irq_domain\n");
-		return -ENOMEM;
-	}
+	if (irq > 0) {
+		bus->domain = irq_domain_create_tree(of_fwnode_handle(node),
+						     &pmic_arb_irq_domain_ops,
+						     bus);
+		if (!bus->domain) {
+			dev_err(&pdev->dev, "unable to create irq_domain\n");
+			return -ENOMEM;
+		}
 
-	irq_set_chained_handler_and_data(bus->irq,
-					 pmic_arb_chained_irq, bus);
+		irq_set_chained_handler_and_data(bus->irq,
+						 pmic_arb_chained_irq, bus);
+	}
 
 	ctrl->dev.of_node = node;
 	dev_set_name(&ctrl->dev, "spmi-%d", bus_index);
@@ -2070,9 +2101,10 @@ static void spmi_pmic_arb_deregister_buses(struct spmi_pmic_arb *pmic_arb)
 	for (i = 0; i < pmic_arb->buses_available; i++) {
 		struct spmi_pmic_arb_bus *bus = pmic_arb->buses[i];
 
-		irq_set_chained_handler_and_data(bus->irq,
-						 NULL, NULL);
-		irq_domain_remove(bus->domain);
+		if (bus->irq > 0)
+			irq_set_chained_handler_and_data(bus->irq, NULL, NULL);
+		if (bus->domain)
+			irq_domain_remove(bus->domain);
 	}
 }
 
@@ -2175,7 +2207,12 @@ static struct platform_driver spmi_pmic_arb_driver = {
 		.of_match_table = spmi_pmic_arb_match_table,
 	},
 };
-module_platform_driver(spmi_pmic_arb_driver);
+
+static int __init spmi_pmic_arb_init(void)
+{
+	return platform_driver_register(&spmi_pmic_arb_driver);
+}
+arch_initcall(spmi_pmic_arb_init); /* RG55G1: before USB VBUS enable */
 
 MODULE_DESCRIPTION("Qualcomm MSM SPMI Controller (PMIC Arbiter) driver");
 MODULE_LICENSE("GPL v2");

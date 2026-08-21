@@ -775,4 +775,8 @@ static int __init chr_dev_init(void)
 	return tty_init();
 }
 
-fs_initcall(chr_dev_init);
+/*
+ * RG55G1 skips LV5 (fs_initcall) under rg55g1_block_deferred; without this,
+ * tty_init/kbd_init never run and USB HID keys never reach the console.
+ */
+arch_initcall(chr_dev_init);

@@ -1456,6 +1456,13 @@ static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *
 		goto err_free;
 	}
 
+	{
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		pr_emerg("rg55g1: usbhid bound %s\n", hid->name);
+		rg55g1_status("HID-OK", 0x00ffff00);
+	}
+
 	return 0;
 err_free:
 	kfree(usbhid);
@@ -1727,7 +1734,7 @@ static void __exit hid_exit(void)
 	hid_quirks_exit(BUS_USB);
 }
 
-module_init(hid_init);
+arch_initcall(hid_init); /* RG55G1: usbhid without full LV6 */
 module_exit(hid_exit);
 
 MODULE_AUTHOR("Andreas Gal");

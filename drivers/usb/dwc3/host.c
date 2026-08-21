@@ -207,6 +207,13 @@ int dwc3_host_init(struct dwc3 *dwc)
 		goto err;
 	}
 
+	{
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		pr_emerg("rg55g1: xhci platform device added\n");
+		rg55g1_status("XHCI-ADD", 0x0000ffff);
+	}
+
 	if (dwc->sys_wakeup) {
 		/* Restore wakeup setting if switched from device */
 		device_wakeup_enable(dwc->sysdev);

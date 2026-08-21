@@ -4,6 +4,8 @@
  */
 
 #include <linux/clk-provider.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -1081,7 +1083,7 @@ static struct clk_branch gcc_aggre_usb3_prim_axi_clk = {
 				&gcc_usb30_prim_master_clk_src.clkr.hw,
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1161,7 +1163,7 @@ static struct clk_branch gcc_cfg_noc_usb3_prim_axi_clk = {
 				&gcc_usb30_prim_master_clk_src.clkr.hw,
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -1220,6 +1222,7 @@ static struct clk_branch gcc_eusb3_0_clkref_en = {
 		.enable_mask = BIT(0),
 		.hw.init = &(const struct clk_init_data) {
 			.name = "gcc_eusb3_0_clkref_en",
+			.flags = CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -2363,7 +2366,7 @@ static struct clk_branch gcc_usb30_prim_master_clk = {
 				&gcc_usb30_prim_master_clk_src.clkr.hw,
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -2381,7 +2384,7 @@ static struct clk_branch gcc_usb30_prim_mock_utmi_clk = {
 				&gcc_usb30_prim_mock_utmi_postdiv_clk_src.clkr.hw,
 			},
 			.num_parents = 1,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -2395,6 +2398,7 @@ static struct clk_branch gcc_usb30_prim_sleep_clk = {
 		.enable_mask = BIT(0),
 		.hw.init = &(const struct clk_init_data) {
 			.name = "gcc_usb30_prim_sleep_clk",
+			.flags = CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -2408,6 +2412,7 @@ static struct clk_branch gcc_usb3_0_clkref_en = {
 		.enable_mask = BIT(0),
 		.hw.init = &(const struct clk_init_data) {
 			.name = "gcc_usb3_0_clkref_en",
+			.flags = CLK_IS_CRITICAL,
 			.ops = &clk_branch2_ops,
 		},
 	},
@@ -2583,7 +2588,8 @@ static struct gdsc gcc_usb30_prim_gdsc = {
 		.name = "gcc_usb30_prim_gdsc",
 	},
 	.pwrsts = PWRSTS_OFF_ON,
-	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+	/* RG55G1: never collapse USB while splash/host are live */
+	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | ALWAYS_ON,
 };
 
 static struct gdsc gcc_vcodec0_gdsc = {
@@ -2828,6 +2834,7 @@ static const struct qcom_cc_desc gcc_sm4450_desc = {
 
 static const struct of_device_id gcc_sm4450_match_table[] = {
 	{ .compatible = "qcom,sm4450-gcc" },
+	{ .compatible = "qcom,ravelin-gcc" }, /* stock RG55G1 / RavelinP DT */
 	{ }
 };
 MODULE_DEVICE_TABLE(of, gcc_sm4450_match_table);
@@ -2861,6 +2868,20 @@ static int gcc_sm4450_probe(struct platform_device *pdev)
 
 	regmap_update_bits(regmap, 0x4201c, BIT(21), BIT(21));
 
+	/*
+	 * RG55G1 bring-up: keep USB30 GDSC + clocks on so host can probe
+	 * without PMIC GDSC regulator / power-domain DT wiring.
+	 * Do NOT assert USB30 BCR here — that drops bootloader clocks and
+	 * leaves xHCI stuck in CNR (probe -ETIMEDOUT / -110).
+	 */
+	regmap_update_bits(regmap, 0x49004, BIT(0), 0); /* USB30_PRIM GDSC on */
+	usleep_range(50, 100);
+	qcom_branch_set_clk_en(regmap, 0x49018); /* GCC_USB30_PRIM_MASTER_CLK */
+	qcom_branch_set_clk_en(regmap, 0x49020); /* GCC_USB30_PRIM_SLEEP_CLK */
+	qcom_branch_set_clk_en(regmap, 0x49024); /* GCC_USB30_PRIM_MOCK_UTMI_CLK */
+	qcom_branch_set_clk_en(regmap, 0x49088); /* GCC_AGGRE_USB3_PRIM_AXI_CLK */
+	qcom_branch_set_clk_en(regmap, 0x49084); /* GCC_CFG_NOC_USB3_PRIM_AXI_CLK */
+
 	return qcom_cc_really_probe(&pdev->dev, &gcc_sm4450_desc, regmap);
 }
 
@@ -2876,7 +2897,7 @@ static int __init gcc_sm4450_init(void)
 {
 	return platform_driver_register(&gcc_sm4450_driver);
 }
-subsys_initcall(gcc_sm4450_init);
+arch_initcall(gcc_sm4450_init); /* before RG55 skips hang-prone subsys level */
 
 static void __exit gcc_sm4450_exit(void)
 {

@@ -132,6 +132,7 @@ struct qcom_snps_hsphy {
 	struct clk_bulk_data *clks;
 	struct reset_control *phy_reset;
 	struct regulator_bulk_data vregs[SNPS_HS_NUM_VREGS];
+	bool skip_vregs;
 
 	bool phy_initialized;
 	enum phy_mode mode;
@@ -141,6 +142,7 @@ struct qcom_snps_hsphy {
 static int qcom_snps_hsphy_clk_init(struct qcom_snps_hsphy *hsphy)
 {
 	struct device *dev = hsphy->dev;
+	extern bool rg55g1_usb_loose_supplies;
 
 	hsphy->num_clks = 2;
 	hsphy->clks = devm_kcalloc(dev, hsphy->num_clks, sizeof(*hsphy->clks), GFP_KERNEL);
@@ -148,8 +150,11 @@ static int qcom_snps_hsphy_clk_init(struct qcom_snps_hsphy *hsphy)
 		return -ENOMEM;
 
 	/*
-	 * TODO: Currently no device tree instantiation of the PHY is using the clock.
-	 * This needs to be fixed in order for this code to be able to use devm_clk_bulk_get().
+	 * Mainline binding: clock-names = "ref" (+ optional cfg_ahb).
+	 * Stock RavelinP DT uses "ref_clk_src"/"ref_clk" with vendor GCC/RPMh
+	 * indices that do not match upstream qcom,sm4450-gcc.h — do not look
+	 * those up (would enable the wrong clocks). Under rg55g1 bring-up,
+	 * proceed with no clocks; the bootloader already left the PHY up.
 	 */
 	hsphy->clks[0].id = "cfg_ahb";
 	hsphy->clks[0].clk = devm_clk_get_optional(dev, "cfg_ahb");
@@ -158,10 +163,19 @@ static int qcom_snps_hsphy_clk_init(struct qcom_snps_hsphy *hsphy)
 				     "failed to get cfg_ahb clk\n");
 
 	hsphy->clks[1].id = "ref";
-	hsphy->clks[1].clk = devm_clk_get(dev, "ref");
+	hsphy->clks[1].clk = devm_clk_get_optional(dev, "ref");
 	if (IS_ERR(hsphy->clks[1].clk))
 		return dev_err_probe(dev, PTR_ERR(hsphy->clks[1].clk),
 				     "failed to get ref clk\n");
+	if (!hsphy->clks[1].clk) {
+		if (rg55g1_usb_loose_supplies) {
+			dev_warn(dev,
+				 "rg55g1: no mainline 'ref' clk (stock names ignored); continuing\n");
+		} else {
+			return dev_err_probe(dev, -ENOENT,
+					     "failed to get ref clk\n");
+		}
+	}
 
 	return 0;
 }
@@ -386,13 +400,104 @@ static const struct override_param_map sc7280_snps_7nm_phy[] = {
 static int qcom_snps_hsphy_init(struct phy *phy)
 {
 	struct qcom_snps_hsphy *hsphy = phy_get_drvdata(phy);
+	extern bool rg55g1_usb_loose_supplies;
 	int ret, i;
 
 	dev_vdbg(&phy->dev, "%s(): Initializing SNPS HS phy\n", __func__);
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
-	if (ret)
-		return ret;
+	/*
+	 * Bootloader already configured the HS PHY. Avoid full POR/reset, but
+	 * clear SIDDQ / assert SLEEPM so UTMI clock keeps running for xHCI.
+	 * Also force VBUSVLDEXT + normal OPMODE — without these the PHY never
+	 * reports connect (CCS stays 0) even when PMIC is sourcing 5V.
+	 */
+	if (rg55g1_usb_loose_supplies) {
+		u32 reg;
+		struct resource *eud_res;
+		void __iomem *eud_en;
+
+		/*
+		 * Stock DT: reg-names = "hsusb_phy_base","eud_enable_reg".
+		 * Clear EUD enable so DWC3 owns D+/D- (else CCS stays 0).
+		 */
+		eud_res = platform_get_resource(to_platform_device(hsphy->dev),
+						IORESOURCE_MEM, 1);
+		if (eud_res) {
+			eud_en = ioremap(eud_res->start, resource_size(eud_res));
+			if (eud_en) {
+				writel(0, eud_en);
+				iounmap(eud_en);
+				dev_warn(&phy->dev,
+					 "rg55g1: cleared eud_enable_reg @%pa\n",
+					 &eud_res->start);
+			}
+		}
+
+		/*
+		 * Soft POR without GCC phy_reset (wrong reset cell on stock DT).
+		 * Leaving bootloader PHY half-init was keeping CCS=0 forever.
+		 */
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_CFG0,
+					   UTMI_PHY_CMN_CTRL_OVERRIDE_EN,
+					   UTMI_PHY_CMN_CTRL_OVERRIDE_EN);
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_UTMI_CTRL5,
+					   POR, POR);
+		usleep_range(40, 60);
+
+		qcom_snps_hsphy_write_mask(hsphy->base,
+					   USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON0,
+					   FSEL_MASK, 0);
+		qcom_snps_hsphy_write_mask(hsphy->base,
+					   USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON1,
+					   PLLBTUNE, PLLBTUNE);
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_REFCLK_CTRL,
+					   REFCLK_SEL_DEFAULT, REFCLK_SEL_MASK);
+		qcom_snps_hsphy_write_mask(hsphy->base,
+					   USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON1,
+					   VBUSVLDEXTSEL0, VBUSVLDEXTSEL0);
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_HS_PHY_CTRL1,
+					   VBUSVLDEXT0, VBUSVLDEXT0);
+		qcom_snps_hsphy_write_mask(hsphy->base,
+					   USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON2,
+					   VREGBYPASS, VREGBYPASS);
+
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_HS_PHY_CTRL2,
+					   USB2_SUSPEND_N_SEL | USB2_SUSPEND_N,
+					   USB2_SUSPEND_N_SEL | USB2_SUSPEND_N);
+
+		/* OPMODE_NORMAL + SLEEPM; clear TERMSEL */
+		reg = readl_relaxed(hsphy->base + USB2_PHY_USB_PHY_UTMI_CTRL0);
+		reg &= ~(OPMODE_MASK | TERMSEL);
+		reg |= SLEEPM;
+		writel_relaxed(reg, hsphy->base + USB2_PHY_USB_PHY_UTMI_CTRL0);
+
+		qcom_snps_hsphy_write_mask(hsphy->base,
+					   USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON0,
+					   SIDDQ, 0);
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_UTMI_CTRL5,
+					   POR, 0);
+		usleep_range(100, 150);
+
+		/*
+		 * Keep SUSPEND_N forced — releasing SEL lets GUSB2PHYCFG.SUSPHY
+		 * put the PHY to sleep and CCS never asserts on this bring-up.
+		 */
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_HS_PHY_CTRL2,
+					   USB2_SUSPEND_N_SEL | USB2_SUSPEND_N,
+					   USB2_SUSPEND_N_SEL | USB2_SUSPEND_N);
+		qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_CFG0,
+					   UTMI_PHY_CMN_CTRL_OVERRIDE_EN, 0);
+
+		hsphy->phy_initialized = true;
+		dev_warn(&phy->dev, "rg55g1: HS PHY soft-POR (hold SUSPEND_N)\n");
+		return 0;
+	}
+
+	if (!hsphy->skip_vregs) {
+		ret = regulator_bulk_enable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
+		if (ret)
+			return ret;
+	}
 
 	ret = clk_bulk_prepare_enable(hsphy->num_clks, hsphy->clks);
 	if (ret) {
@@ -471,7 +576,8 @@ static int qcom_snps_hsphy_init(struct phy *phy)
 disable_clks:
 	clk_bulk_disable_unprepare(hsphy->num_clks, hsphy->clks);
 poweroff_phy:
-	regulator_bulk_disable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
+	if (!hsphy->skip_vregs)
+		regulator_bulk_disable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
 
 	return ret;
 }
@@ -482,7 +588,8 @@ static int qcom_snps_hsphy_exit(struct phy *phy)
 
 	reset_control_assert(hsphy->phy_reset);
 	clk_bulk_disable_unprepare(hsphy->num_clks, hsphy->clks);
-	regulator_bulk_disable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
+	if (!hsphy->skip_vregs)
+		regulator_bulk_disable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
 	hsphy->phy_initialized = false;
 
 	return 0;
@@ -586,20 +693,48 @@ static int qcom_snps_hsphy_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to initialize clocks\n");
 
-	hsphy->phy_reset = devm_reset_control_get_exclusive(&pdev->dev, NULL);
-	if (IS_ERR(hsphy->phy_reset)) {
-		dev_err(dev, "failed to get phy core reset\n");
-		return PTR_ERR(hsphy->phy_reset);
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		/*
+		 * Stock reset cell indices do not match upstream sm4450-gcc
+		 * (e.g. 0x0d is QUPV3_WRAPPER_1_BCR upstream, not QUSB2PHY).
+		 * Never touch them during bring-up.
+		 */
+		if (rg55g1_usb_loose_supplies) {
+			hsphy->phy_reset = NULL;
+			dev_warn(dev, "rg55g1: skipping stock phy_reset\n");
+		} else {
+			hsphy->phy_reset =
+				devm_reset_control_get_exclusive(&pdev->dev, NULL);
+			if (IS_ERR(hsphy->phy_reset)) {
+				dev_err(dev, "failed to get phy core reset\n");
+				return PTR_ERR(hsphy->phy_reset);
+			}
+		}
 	}
 
 	num = ARRAY_SIZE(hsphy->vregs);
 	for (i = 0; i < num; i++)
 		hsphy->vregs[i].supply = qcom_snps_hsphy_vreg_names[i];
 
-	ret = devm_regulator_bulk_get(dev, num, hsphy->vregs);
-	if (ret)
-		return dev_err_probe(dev, ret,
-				     "failed to get regulator supplies\n");
+	{
+		extern bool rg55g1_usb_loose_supplies;
+
+		/*
+		 * Stock DT uses vdd/vdda18/vdda33 from PMIC; mainline expects
+		 * vdda-pll/vdda18/vdda33. PMIC is not up — skip entirely.
+		 */
+		if (rg55g1_usb_loose_supplies) {
+			hsphy->skip_vregs = true;
+			dev_warn(dev, "rg55g1: skipping PHY regulators\n");
+		} else {
+			ret = devm_regulator_bulk_get(dev, num, hsphy->vregs);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "failed to get regulator supplies\n");
+		}
+	}
 
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
@@ -639,7 +774,11 @@ static struct platform_driver qcom_snps_hsphy_driver = {
 	},
 };
 
-module_platform_driver(qcom_snps_hsphy_driver);
+static int __init qcom_snps_hsphy_driver_init(void)
+{
+	return platform_driver_register(&qcom_snps_hsphy_driver);
+}
+arch_initcall(qcom_snps_hsphy_driver_init);
 
 MODULE_DESCRIPTION("Qualcomm SNPS FEMTO USB HS PHY V2 driver");
 MODULE_LICENSE("GPL v2");

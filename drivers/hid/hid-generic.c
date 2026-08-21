@@ -91,7 +91,11 @@ static struct hid_driver hid_generic = {
 	.probe = hid_generic_probe,
 	.reset_resume = hid_generic_reset_resume,
 };
-module_hid_driver(hid_generic);
+static int __init hid_generic_init(void)
+{
+	return hid_register_driver(&hid_generic);
+}
+arch_initcall(hid_generic_init);
 
 MODULE_AUTHOR("Henrik Rydberg");
 MODULE_DESCRIPTION("HID generic driver");

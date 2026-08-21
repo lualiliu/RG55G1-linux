@@ -43,6 +43,14 @@ config SPMI_MSM_PMIC_ARB
 	  This is required for communicating with Qualcomm PMICs and
 	  other devices that have the SPMI interface.
 
+config SPMI_MSM_PMIC_ARB_DEBUG
+	tristate "Qualcomm MSM SPMI PMIC Arbiter debug bus"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on HAS_IOMEM
+	help
+	  Debug SPMI arbiter that bypasses EE ownership. Used on RG55G1
+	  to enable PM7250B OTG VBUS from HLOS when ADSP owns the channel.
+
 config SPMI_MTK_PMIF
 	tristate "Mediatek SPMI Controller (PMIC Arbiter)"
 	depends on ARCH_MEDIATEK || COMPILE_TEST

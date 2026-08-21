@@ -1248,25 +1248,21 @@ static int qcom_smem_probe(struct platform_device *pdev)
 	if (ret < 0 && ret != -ENOENT)
 		return ret;
 
-	smem->debugfs_dir = smem_dram_parse(smem, smem->dev);
-	if (IS_ERR(smem->debugfs_dir))
-		smem->debugfs_dir = NULL;
+	/* Skip DRAMC parse — unknown layouts warn then later paths hang. */
+	smem->debugfs_dir = NULL;
 
 	{
 		extern bool rg55g1_block_deferred;
 
-		/* Freeze deferred retries that hang on stock DT bring-up. */
 		rg55g1_block_deferred = true;
 	}
 
 	__smem = smem;
 
-	/*
-	 * Skip socinfo during bring-up: registering it can kick deferred
-	 * probes (USB/SMMU/SPMI/…) that hang on this stock DT.
-	 */
+	/* Skip socinfo — registering it kicks deferred probes that hang. */
 	smem->socinfo = NULL;
 
+	pr_info("rg55g1: smem probe done (socinfo/dramc skipped)\n");
 	return 0;
 }
 

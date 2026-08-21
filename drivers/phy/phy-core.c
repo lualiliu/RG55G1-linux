@@ -1302,7 +1302,7 @@ static int __init phy_core_init(void)
 
 	return 0;
 }
-device_initcall(phy_core_init);
+arch_initcall(phy_core_init); /* RG55G1: PHY class before USB phy drivers */
 
 static void __exit phy_core_exit(void)
 {

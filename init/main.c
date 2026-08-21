@@ -1414,16 +1414,68 @@ static void __init do_initcalls(void)
 	int level;
 	size_t len = saved_command_line_len + 1;
 	char *command_line;
+	extern bool rg55g1_block_deferred;
+	extern void rg55g1_status(const char *msg, u32 color);
+	extern void rg55g1_force_populate_rootfs(void);
 
 	command_line = kzalloc(len, GFP_KERNEL);
 	if (!command_line)
 		panic("%s: Failed to allocate %zu bytes\n", __func__, len);
+
+	rg55g1_status("INITCALLS", 0x00ff00ff);
+
+	/*
+	 * RG55G1: after arch (SKIP-OF) the stock DT path hangs in
+	 * subsys/fs/device initcalls. Run pure..arch only, force
+	 * embedded initramfs unpack, then continue to /init ash.
+	 */
+	if (rg55g1_block_deferred) {
+		for (level = 0; level <= 3; level++) {
+			char tag[16];
+
+			snprintf(tag, sizeof(tag), "LV%d", level);
+			rg55g1_status(tag, 0x0080ff00);
+			strcpy(command_line, saved_command_line);
+			do_initcall_level(level, command_line);
+		}
+		rg55g1_status("SKIP-SUB0", 0x00ff00ff);
+		rg55g1_force_populate_rootfs();
+
+		/*
+		 * Full LV4/LV6 hang or BUG (kobject netns). USB stack drivers
+		 * were moved to arch_initcall; only populate USB devices here.
+		 */
+		{
+			extern int rg55g1_bringup_usb(void);
+			extern void driver_deferred_probe_trigger(void);
+			int n;
+
+			rg55g1_status("USB-POP", 0x00ff8000);
+			n = rg55g1_bringup_usb();
+			msleep(500);
+			driver_deferred_probe_trigger();
+			msleep(500);
+			rg55g1_status(n > 0 ? "USB-WAIT" : "USB-SKIP",
+				      0x0000ffff);
+			/* Pin VBUS sticky again after late XHCI/PORTSC lines. */
+			{
+				extern int rg55g1_vbus_refresh(void);
+
+				(void)rg55g1_vbus_refresh();
+			}
+		}
+
+		rg55g1_status("IC-DONE", 0x0000ff00);
+		kfree(command_line);
+		return;
+	}
 
 	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++) {
 		/* Parser modifies command_line, restore it each time */
 		strcpy(command_line, saved_command_line);
 		do_initcall_level(level, command_line);
 	}
+	rg55g1_status("IC-DONE", 0x0000ff00);
 
 	kfree(command_line);
 }
@@ -1569,7 +1621,14 @@ static int __ref kernel_init(void *unused)
 
 	do_sysctl_args();
 
+	{
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		rg55g1_status("EXEC-INIT", 0x00ffffff);
+	}
+
 	if (ramdisk_execute_command) {
+		pr_emerg("rg55g1: exec %s\n", ramdisk_execute_command);
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
 			return 0;
@@ -1656,9 +1715,22 @@ static noinline void __init kernel_init_freeable(void)
 
 	do_basic_setup();
 
+	{
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		rg55g1_status("BASIC-OK", 0x00c000ff);
+	}
+
 	kunit_run_all_tests();
 
+	pr_emerg("rg55g1: wait_for_initramfs...\n");
 	wait_for_initramfs();
+	{
+		extern void rg55g1_status(const char *msg, u32 color);
+
+		rg55g1_status("RAMFS-OK", 0x0000ff00);
+	}
+	pr_emerg("rg55g1: initramfs ready, console_on_rootfs\n");
 	console_on_rootfs();
 
 	/*
@@ -1670,6 +1742,9 @@ static noinline void __init kernel_init_freeable(void)
 		int ramdisk_command_access;
 
 		ramdisk_command_access = init_eaccess(ramdisk_execute_command);
+		pr_emerg("rg55g1: eaccess(%s)=%d\n",
+			ramdisk_execute_command ? ramdisk_execute_command : "(null)",
+			ramdisk_command_access);
 		if (ramdisk_command_access != 0) {
 			if (ramdisk_execute_command_set)
 				pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
@@ -1678,6 +1753,8 @@ static noinline void __init kernel_init_freeable(void)
 			/* prepare_namespace() hangs with no root= on this bring-up */
 			if (!rg55g1_block_deferred)
 				prepare_namespace();
+			else
+				pr_emerg("rg55g1: skip prepare_namespace\n");
 		}
 	}
 

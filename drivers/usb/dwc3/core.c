@@ -329,7 +329,8 @@ int dwc3_core_soft_reset(struct dwc3 *dwc)
 	 * XHCI driver will reset the host block. If dwc3 was configured for
 	 * host-only mode, then we can return early.
 	 */
-	if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST)
+	if (dwc->dr_mode == USB_DR_MODE_HOST ||
+	    dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST)
 		return 0;
 
 	reg = dwc3_readl(dwc, DWC3_DCTL);
@@ -2857,7 +2858,11 @@ static struct platform_driver dwc3_driver = {
 	},
 };
 
-module_platform_driver(dwc3_driver);
+static int __init dwc3_driver_init(void)
+{
+	return platform_driver_register(&dwc3_driver);
+}
+arch_initcall(dwc3_driver_init);
 
 MODULE_ALIAS("platform:dwc3");
 MODULE_AUTHOR("Felipe Balbi <balbi@ti.com>");
