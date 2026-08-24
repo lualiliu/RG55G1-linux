@@ -1442,6 +1442,18 @@ static void __init do_initcalls(void)
 		rg55g1_force_populate_rootfs();
 
 		/*
+		 * Level-4 block subsys initcalls are skipped below; mmcblk
+		 * needs bio/genhd/blk-mq before SDHCI creates /dev/mmcblk*.
+		 */
+		{
+			extern int __init rg55g1_subsys_bringup(void);
+
+			rg55g1_status("SUBSYS", 0x00ff8000);
+			if (rg55g1_subsys_bringup())
+				rg55g1_status("SUB-!", 0x00ff0000);
+		}
+
+		/*
 		 * Full LV4/LV6 hang or BUG (kobject netns). USB stack drivers
 		 * were moved to arch_initcall; only populate USB devices here.
 		 */

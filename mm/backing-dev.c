@@ -489,7 +489,7 @@ static __init int bdi_class_init(void)
 }
 postcore_initcall(bdi_class_init);
 
-static int __init default_bdi_init(void)
+int __init default_bdi_init(void)
 {
 	bdi_wq = alloc_workqueue("writeback", WQ_MEM_RECLAIM | WQ_UNBOUND |
 				 WQ_SYSFS, 0);
@@ -968,7 +968,7 @@ static void cgwb_bdi_register(struct backing_dev_info *bdi)
 	spin_unlock_irq(&cgwb_lock);
 }
 
-static int __init cgwb_init(void)
+int __init cgwb_init(void)
 {
 	/*
 	 * There can be many concurrent release work items overwhelming
@@ -1156,6 +1156,9 @@ static void bdi_remove_from_list(struct backing_dev_info *bdi)
 
 void bdi_unregister(struct backing_dev_info *bdi)
 {
+	if (!bdi)
+		return;
+
 	/* make sure nobody finds us on the bdi_list anymore */
 	bdi_remove_from_list(bdi);
 	wb_shutdown(&bdi->wb);

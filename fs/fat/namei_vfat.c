@@ -1243,7 +1243,7 @@ static struct file_system_type vfat_fs_type = {
 };
 MODULE_ALIAS_FS("vfat");
 
-static int __init init_vfat_fs(void)
+int __init init_vfat_fs(void)
 {
 	return register_filesystem(&vfat_fs_type);
 }

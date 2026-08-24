@@ -737,7 +737,8 @@ static void __del_gendisk(struct gendisk *disk)
 		 * Unregister bdi before releasing device numbers (as they can
 		 * get reused and we'd get clashes in sysfs).
 		 */
-		bdi_unregister(disk->bdi);
+		if (disk->bdi)
+			bdi_unregister(disk->bdi);
 	}
 
 	blk_unregister_queue(disk);
@@ -992,7 +993,7 @@ static const struct seq_operations partitions_op = {
 };
 #endif
 
-static int __init genhd_device_init(void)
+int __init genhd_device_init(void)
 {
 	int error;
 

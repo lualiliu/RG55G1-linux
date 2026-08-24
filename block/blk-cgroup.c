@@ -253,7 +253,7 @@ void blkcg_punt_bio_submit(struct bio *bio)
 }
 EXPORT_SYMBOL_GPL(blkcg_punt_bio_submit);
 
-static int __init blkcg_punt_bio_init(void)
+int __init blkcg_punt_bio_init(void)
 {
 	blkcg_punt_bio_wq = alloc_workqueue("blkcg_punt_bio",
 					    WQ_MEM_RECLAIM | WQ_FREEZABLE |

@@ -482,6 +482,9 @@ enum elv_merge blk_try_merge(struct request *rq, struct bio *bio);
 int blk_set_default_limits(struct queue_limits *lim);
 void blk_apply_bdi_limits(struct backing_dev_info *bdi,
 		struct queue_limits *lim);
+int __init init_bio(void);
+int __init genhd_device_init(void);
+int __init blk_mq_init(void);
 int blk_dev_init(void);
 
 void update_io_ticks(struct block_device *part, unsigned long now, bool end);

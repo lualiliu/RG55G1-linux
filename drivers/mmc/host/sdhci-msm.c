@@ -6,6 +6,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/mmc/mmc.h>
 #include <linux/pm_runtime.h>
@@ -2601,6 +2602,13 @@ static inline void sdhci_msm_get_of_property(struct platform_device *pdev,
 
 	if (of_device_is_compatible(node, "qcom,msm8916-sdhci"))
 		host->quirks2 |= SDHCI_QUIRK2_BROKEN_64_BIT_DMA;
+
+	/* RG55G1: SMMU/DMA not wired yet — use PIO on this node only. */
+	if (of_property_read_bool(node, "qcom,force-pio")) {
+		host->quirks |= SDHCI_QUIRK_BROKEN_ADMA | SDHCI_QUIRK_BROKEN_DMA |
+				SDHCI_QUIRK_NO_LED;
+		host->quirks2 |= SDHCI_QUIRK2_BROKEN_64_BIT_DMA;
+	}
 }
 
 static int sdhci_msm_gcc_reset(struct device *dev, struct sdhci_host *host)
@@ -3001,7 +3009,21 @@ static struct platform_driver sdhci_msm_driver = {
 	},
 };
 
+#if IS_BUILTIN(CONFIG_MMC_SDHCI_MSM)
+static int __init sdhci_msm_init(void)
+{
+	return platform_driver_register(&sdhci_msm_driver);
+}
+arch_initcall(sdhci_msm_init); /* RG55G1: SDHCI without full device level */
+#else
 module_platform_driver(sdhci_msm_driver);
+#endif
+
+static void __exit sdhci_msm_exit(void)
+{
+	platform_driver_unregister(&sdhci_msm_driver);
+}
+module_exit(sdhci_msm_exit);
 
 MODULE_DESCRIPTION("Qualcomm Secure Digital Host Controller Interface driver");
 MODULE_LICENSE("GPL v2");

@@ -5276,7 +5276,7 @@ void blk_mq_cancel_work_sync(struct request_queue *q)
 		cancel_delayed_work_sync(&hctx->run_work);
 }
 
-static int __init blk_mq_init(void)
+int __init blk_mq_init(void)
 {
 	int i;
 

@@ -433,7 +433,7 @@ struct io_cq *ioc_find_get_icq(struct request_queue *q)
 EXPORT_SYMBOL_GPL(ioc_find_get_icq);
 #endif /* CONFIG_BLK_ICQ */
 
-static int __init blk_ioc_init(void)
+int __init blk_ioc_init(void)
 {
 	iocontext_cachep = kmem_cache_create("blkdev_ioc",
 			sizeof(struct io_context), 0, SLAB_PANIC, NULL);

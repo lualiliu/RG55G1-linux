@@ -2983,7 +2983,12 @@ static void mmc_blk_remove_req(struct mmc_blk_data *md)
 	/*
 	 * Flush remaining requests and free queues. It is freeing the queue
 	 * that stops new requests from being accepted.
+	 *
+	 * Mark the disk surprise-dead first so del_gendisk does not try to
+	 * sync/writeback to a yanked card (can NULL-deref on partial bringup).
 	 */
+	if (md->disk)
+		blk_mark_disk_dead(md->disk);
 	del_gendisk(md->disk);
 	mmc_cleanup_queue(&md->queue);
 	mmc_blk_put(md);
@@ -3381,7 +3386,16 @@ static void __exit mmc_blk_exit(void)
 	bus_unregister(&mmc_rpmb_bus_type);
 }
 
+static int __init mmc_blk_early_init(void)
+{
+	return mmc_blk_init();
+}
+
+#if IS_BUILTIN(CONFIG_MMC_BLOCK)
+arch_initcall(mmc_blk_early_init); /* RG55G1: mmcblk without full device level */
+#else
 module_init(mmc_blk_init);
+#endif
 module_exit(mmc_blk_exit);
 
 MODULE_LICENSE("GPL");

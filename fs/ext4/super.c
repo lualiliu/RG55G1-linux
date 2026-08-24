@@ -7513,7 +7513,7 @@ static struct file_system_type ext4_fs_type = {
 };
 MODULE_ALIAS_FS("ext4");
 
-static int __init ext4_init_fs(void)
+int __init ext4_init_fs(void)
 {
 	int err;
 

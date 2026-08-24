@@ -1015,7 +1015,7 @@ static struct elevator_type mq_deadline = {
 };
 MODULE_ALIAS("mq-deadline-iosched");
 
-static int __init deadline_init(void)
+int __init deadline_init(void)
 {
 	return elv_register(&mq_deadline);
 }

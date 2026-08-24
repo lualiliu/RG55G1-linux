@@ -241,7 +241,7 @@ static struct nls_table table = {
 	.charset2upper	= charset2upper,
 };
 
-static int __init init_nls_iso8859_1(void)
+int __init init_nls_iso8859_1(void)
 {
 	return register_nls(&table);
 }

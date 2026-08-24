@@ -1963,7 +1963,7 @@ void fat_free_fc(struct fs_context *fc)
 }
 EXPORT_SYMBOL_GPL(fat_free_fc);
 
-static int __init init_fat_fs(void)
+int __init init_fat_fs(void)
 {
 	int err;
 

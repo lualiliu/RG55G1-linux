@@ -7586,50 +7586,32 @@
 			};
 		};
 
+		/*
+		 * eMMC (SDC1). Clocks/resets use mainline qcom,sm4450-gcc.h
+		 * indices (stock Android DT used different numbering).
+		 * Supplies/pinctrl/iommu/icc stripped for bring-up: BL left
+		 * rails/pins on; phys DMA via apps-smmu SID bypass.
+		 */
 		sdhci@7C4000 {
-			status = "disabled";
+			status = "okay";
 			compatible = "qcom,sdhci-msm-v5";
-			reg = <0x7c4000 0x1000 0x7c5000 0x1000 0x7c8000 0x8000 0x7d0000 0x9000>;
-			reg-names = "hc\0cqhci\0cqhci_ice\0cqhci_ice_hwkm";
+			reg = <0x7c4000 0x1000>;
+			reg-names = "hc";
 			interrupts = <0 135 4 0 137 4>;
 			interrupt-names = "hc_irq\0pwr_irq";
 			bus-width = <8>;
 			non-removable;
-			supports-cqe;
 			no-sd;
 			no-sdio;
 			mmc-ddr-1_8v;
 			mmc-hs200-1_8v;
-			mmc-hs400-1_8v;
-			mmc-hs400-enhanced-strobe;
-			qcom,devfreq,freq-table = <50000000 200000000>;
-			qcom,scaling-lower-bus-speed-mode = "DDR52";
 			cap-mmc-hw-reset;
-			clocks = <36 88 36 89 36 91>;
-			clock-names = "iface\0core\0ice_core";
-			qcom,ice-clk-rates = <300000000 100000000>;
-			qcom,dll-hsr-list = <1008684 0 1 738265088 2147747944>;
-			resets = <36 15>;
+			/* GCC_SDCC1_AHB_CLK=96, GCC_SDCC1_APPS_CLK=97, BCR=16 */
+			clocks = <36 96 36 97>;
+			clock-names = "iface\0core";
+			resets = <36 16>;
 			reset-names = "core_reset";
-			iommus = <47 1376 0>;
-			dma-coherent;
-			qcom,iommu-dma = "fastmap";
-			qcom,iommu-dma-addr-pool = <1073741824 268435456>;
-			qcom,iommu-geometry = <1073741824 268435456>;
-			interconnects = <60 51 41 512 37 2 61 544>;
-			interconnect-names = "sdhc-ddr\0cpu-sdhc";
-			operating-points-v2 = <329>;
 			phandle = <713>;
-
-			qos0 {
-				mask = <3>;
-				vote = <44>;
-			};
-
-			qos1 {
-				mask = <63>;
-				vote = <44>;
-			};
 		};
 
 		sdhc2-opp-table {
@@ -7650,8 +7632,12 @@
 			};
 		};
 
+		/*
+		 * SD card (SDC2). broken-cd: poll without TLMM cd-gpio yet.
+		 * GCC_SDCC2_AHB_CLK=101, GCC_SDCC2_APPS_CLK=102, BCR=17.
+		 */
 		sdhci@8804000 {
-			status = "disabled";
+			status = "okay";
 			compatible = "qcom,sdhci-msm-v5";
 			reg = <0x8804000 0x1000>;
 			reg-names = "hc";
@@ -7660,29 +7646,12 @@
 			bus-width = <4>;
 			no-sdio;
 			no-mmc;
-			qcom,restore-after-cx-collapse;
-			clocks = <36 93 36 94>;
+			broken-cd;
+			clocks = <36 101 36 102>;
 			clock-names = "iface\0core";
-			qcom,dll-hsr-list = <484396 0 16 738265088 2147747944>;
-			iommus = <47 320 0>;
-			dma-coherent;
-			qcom,iommu-dma = "fastmap";
-			qcom,iommu-dma-addr-pool = <1073741824 268435456>;
-			qcom,iommu-geometry = <1073741824 268435456>;
-			interconnects = <330 52 41 512 37 2 61 545>;
-			interconnect-names = "sdhc-ddr\0cpu-sdhc";
-			operating-points-v2 = <331>;
+			resets = <36 17>;
+			reset-names = "core_reset";
 			phandle = <714>;
-
-			qos0 {
-				mask = <3>;
-				vote = <44>;
-			};
-
-			qos1 {
-				mask = <63>;
-				vote = <44>;
-			};
 		};
 
 		cpu-pmu {

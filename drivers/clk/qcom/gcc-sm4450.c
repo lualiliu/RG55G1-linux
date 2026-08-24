@@ -2882,6 +2882,15 @@ static int gcc_sm4450_probe(struct platform_device *pdev)
 	qcom_branch_set_clk_en(regmap, 0x49088); /* GCC_AGGRE_USB3_PRIM_AXI_CLK */
 	qcom_branch_set_clk_en(regmap, 0x49084); /* GCC_CFG_NOC_USB3_PRIM_AXI_CLK */
 
+	/*
+	 * Keep SDCC clocks on for eMMC/SD bring-up (same pattern as USB:
+	 * do not touch SDCC BCR — BL already left the controllers usable).
+	 */
+	qcom_branch_set_clk_en(regmap, 0xb3004); /* GCC_SDCC1_AHB_CLK */
+	qcom_branch_set_clk_en(regmap, 0xb3008); /* GCC_SDCC1_APPS_CLK */
+	qcom_branch_set_clk_en(regmap, 0x2400c); /* GCC_SDCC2_AHB_CLK */
+	qcom_branch_set_clk_en(regmap, 0x24004); /* GCC_SDCC2_APPS_CLK */
+
 	return qcom_cc_really_probe(&pdev->dev, &gcc_sm4450_desc, regmap);
 }
 

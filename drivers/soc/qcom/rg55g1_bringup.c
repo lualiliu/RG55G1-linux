@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * RG55G1 bring-up: reach ash on splash FB, then enable a minimal USB host
- * path so a USB keyboard can feed tty0.
+ * path so a USB keyboard can feed tty0, plus SDHCI for /dev/mmcblk*.
  */
 
 #include <linux/bits.h>
@@ -70,6 +70,12 @@ static void rg55g1_force_disabled_node(struct device_node *np)
 	rg55g1_force_status(np, "disabled");
 }
 
+static bool rg55g1_is_sdhci(struct device_node *np)
+{
+	return of_device_is_compatible(np, "qcom,sdhci-msm-v5") ||
+	       of_device_is_compatible(np, "qcom,sdhci-msm-v4");
+}
+
 static bool rg55g1_is_usb_keep(struct device_node *np)
 {
 	/* HS-only: skip SS PHY and nop-xceiv (legacy usb-phy / dummy vbus). */
@@ -85,7 +91,8 @@ static bool rg55g1_is_usb_keep(struct device_node *np)
 	       of_device_is_compatible(np, "qcom,spmi-pmic-arb-debug") ||
 	       of_device_is_compatible(np, "qcom,qsmmu-v500") ||
 	       of_device_is_compatible(np, "qcom,smmu-500") ||
-	       of_device_is_compatible(np, "arm,mmu-500");
+	       of_device_is_compatible(np, "arm,mmu-500") ||
+	       rg55g1_is_sdhci(np);
 }
 
 static int rg55g1_disable_children(const char *path)
@@ -322,7 +329,7 @@ static void rg55g1_patch_ssusb_glue(struct device_node *ssusb)
 }
 
 /**
- * rg55g1_sanitize_dt() - disable hang-prone DT nodes; keep USB/GCC.
+ * rg55g1_sanitize_dt() - disable hang-prone DT nodes; keep USB/GCC/SDHCI.
  */
 int rg55g1_sanitize_dt(void)
 {
@@ -358,7 +365,7 @@ int rg55g1_sanitize_dt(void)
 		of_node_put(rm);
 	}
 
-	pr_emerg("rg55g1: DT sanitize disabled %d nodes (kept USB/GCC)\n", n);
+	pr_emerg("rg55g1: DT sanitize disabled %d nodes (kept USB/GCC/SDHCI)\n", n);
 	return n;
 }
 EXPORT_SYMBOL_GPL(rg55g1_sanitize_dt);
@@ -1077,6 +1084,55 @@ static int rg55g1_enable_hsphy_rails(void)
 }
 
 /**
+ * rg55g1_enable_sd_rails() - SD slot LDOs (stock dtbo fragment@26).
+ *
+ * L24B (ldob24) ~2.96V vmmc, L28B (ldob28) 1.8V vqmmc.
+ */
+static int rg55g1_enable_sd_rails(void)
+{
+	static const struct {
+		const char *name;
+		u32 uv;
+	} rails[] = {
+		{ "ldob24", 2960000 },
+		{ "ldob28", 1800000 },
+	};
+	struct tcs_cmd cmds[4];
+	int i, n = 0, ret, ok = 0;
+
+	if (cmd_db_ready()) {
+		rg55g1_status("SD-LDO!", 0x00ff8000);
+		return -EAGAIN;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(rails); i++) {
+		u32 addr = cmd_db_read_addr(rails[i].name);
+
+		if (!addr) {
+			pr_emerg("rg55g1: cmd-db missing %s\n", rails[i].name);
+			continue;
+		}
+		cmds[n].addr = addr + 0x0;
+		cmds[n].data = DIV_ROUND_UP(rails[i].uv, 1000);
+		cmds[n].wait = 1;
+		n++;
+		cmds[n].addr = addr + 0x4;
+		cmds[n].data = 1;
+		cmds[n].wait = 1;
+		n++;
+		ok++;
+	}
+
+	if (!n)
+		return -ENOENT;
+
+	ret = rg55g1_rpmh_raw_cmds(cmds, n);
+	pr_emerg("rg55g1: SD RPMh vote (%d cmds, %d rails) -> %d\n", n, ok, ret);
+	usleep_range(2000, 3000);
+	return ret;
+}
+
+/**
  * rg55g1_usb_phy_clk_reset() - ungated HS PHY CSR space.
  *
  * Diagnostic P=0 (UTMI_CTRL0) means 0x88e3000 is dead: QUSB2PHY still in BCR
@@ -1278,12 +1334,79 @@ static bool rg55g1_smmu_bypass_cb(void __iomem *smmu, u32 id1, u32 *cbndx_out)
 	return false;
 }
 
+/**
+ * rg55g1_smmu_install_exact() - exact SID SMR that wins first-match.
+ *
+ * Same rules as USB: never clear VALID on broad entries; relocate if needed.
+ */
+static int rg55g1_smmu_install_exact(void __iomem *smmu, u32 numsmr, u32 sid,
+				     u32 want_s2cr, const char *tag)
+{
+	u32 smr, s2cr, old_s2cr;
+	int first = -1, free_smr = -1, target = -1;
+	unsigned int i;
+
+	for (i = 0; i < numsmr; i++) {
+		u32 id, mask;
+
+		smr = readl_relaxed(smmu + 0x800 + (i << 2));
+		if (!(smr & BIT(31))) {
+			if (free_smr < 0)
+				free_smr = i;
+			continue;
+		}
+		id = smr & 0xffff;
+		mask = (smr >> 16) & 0x7fff;
+		if ((sid & ~mask) != (id & ~mask))
+			continue;
+		if (first < 0)
+			first = i;
+	}
+
+	if (first < 0) {
+		if (free_smr < 0)
+			return -ENOENT;
+		target = free_smr;
+	} else {
+		smr = readl_relaxed(smmu + 0x800 + (first << 2));
+		if (((smr >> 16) & 0x7fff) == 0 && (smr & 0xffff) == sid) {
+			target = first;
+		} else if (free_smr >= 0 && free_smr < first) {
+			target = free_smr;
+		} else if (free_smr > first) {
+			old_s2cr = readl_relaxed(smmu + 0xc00 + (first << 2));
+			writel_relaxed(smr, smmu + 0x800 + (free_smr << 2));
+			writel_relaxed(old_s2cr, smmu + 0xc00 + (free_smr << 2));
+			if (readl_relaxed(smmu + 0x800 + (free_smr << 2)) != smr ||
+			    readl_relaxed(smmu + 0xc00 + (free_smr << 2)) != old_s2cr)
+				return -EPERM;
+			target = first;
+			pr_emerg("rg55g1: %s relocated SMR[%d]→[%d]\n",
+				 tag, first, free_smr);
+		} else {
+			return -ENOSPC;
+		}
+	}
+
+	writel_relaxed(BIT(31) | sid, smmu + 0x800 + (target << 2));
+	writel_relaxed(want_s2cr, smmu + 0xc00 + (target << 2));
+
+	smr = readl_relaxed(smmu + 0x800 + (target << 2));
+	s2cr = readl_relaxed(smmu + 0xc00 + (target << 2));
+	if (!(smr & BIT(31)) || (smr & 0xffff) != sid)
+		return -EPERM;
+
+	pr_emerg("rg55g1: SMMU %s SMR[%d]=0x%x s2cr=0x%x\n",
+		 tag, target, smr, s2cr);
+	return target;
+}
+
 static int rg55g1_bringup_apps_smmu(void)
 {
 	void __iomem *gcc, *smmu;
-	u32 id0, id1, scr0, smr, s2cr, want_s2cr, cbndx = 0;
-	u32 numsmr, i, sid = 0x540;
-	int first = -1, free_smr = -1, usb_idx = -1;
+	u32 id0, id1, scr0, want_s2cr, cbndx = 0;
+	u32 numsmr;
+	int ret;
 
 	gcc = ioremap(0x00100000, 0xa0000);
 	if (gcc) {
@@ -1322,85 +1445,168 @@ static int rg55g1_bringup_apps_smmu(void)
 	if (!numsmr || numsmr > 256)
 		numsmr = 128;
 
-	for (i = 0; i < numsmr; i++) {
-		u32 id, mask;
-
-		smr = readl_relaxed(smmu + 0x800 + (i << 2));
-		if (!(smr & BIT(31))) {
-			if (free_smr < 0)
-				free_smr = i;
-			continue;
-		}
-		id = smr & 0xffff;
-		mask = (smr >> 16) & 0x7fff;
-		if ((sid & ~mask) != (id & ~mask))
-			continue;
-		s2cr = readl_relaxed(smmu + 0xc00 + (i << 2));
-		pr_emerg("rg55g1: SMR[%u] match SID 0x%x smr=0x%x s2cr=0x%x\n",
-			 i, sid, smr, s2cr);
-		if (first < 0)
-			first = i;
-	}
-
-	want_s2cr = FIELD_PREP(GENMASK(17, 16), 0) | /* TRANS → disabled CB */
+	want_s2cr = FIELD_PREP(GENMASK(17, 16), 0) |
 		    FIELD_PREP(GENMASK(7, 0), cbndx);
 
-	if (first < 0) {
-		if (free_smr < 0) {
-			rg55g1_status("SMMU-NSID", 0x00ff8000);
-			iounmap(smmu);
-			return -ENOENT;
-		}
-		usb_idx = free_smr;
-	} else {
-		smr = readl_relaxed(smmu + 0x800 + (first << 2));
-		if (((smr >> 16) & 0x7fff) == 0 && (smr & 0xffff) == sid) {
-			usb_idx = first;
-		} else if (free_smr >= 0 && free_smr < first) {
-			usb_idx = free_smr;
-		} else if (free_smr > first) {
-			u32 old_s2cr = readl_relaxed(smmu + 0xc00 + (first << 2));
-
-			/* Copy broad entry first; abort if TZ ignores the copy. */
-			writel_relaxed(smr, smmu + 0x800 + (free_smr << 2));
-			writel_relaxed(old_s2cr, smmu + 0xc00 + (free_smr << 2));
-			if (readl_relaxed(smmu + 0x800 + (free_smr << 2)) != smr ||
-			    readl_relaxed(smmu + 0xc00 + (free_smr << 2)) != old_s2cr) {
-				pr_emerg("rg55g1: relocate copy to SMR[%d] rejected\n",
-					 free_smr);
-				rg55g1_status("SMMU-TZ", 0x00ff8000);
-				iounmap(smmu);
-				return -EPERM;
-			}
-			usb_idx = first;
-			pr_emerg("rg55g1: relocated SMR[%d]→[%d] (verified)\n",
-				 first, free_smr);
-		} else {
-			rg55g1_status("SMMU-FULL", 0x00ff8000);
-			iounmap(smmu);
-			return -ENOSPC;
-		}
-	}
-
-	/* Exact VALID SMR + bypass CB. Never clear VALID, never USFCFG. */
-	writel_relaxed(BIT(31) | sid, smmu + 0x800 + (usb_idx << 2));
-	writel_relaxed(want_s2cr, smmu + 0xc00 + (usb_idx << 2));
-
-	smr = readl_relaxed(smmu + 0x800 + (usb_idx << 2));
-	s2cr = readl_relaxed(smmu + 0xc00 + (usb_idx << 2));
-	if (!(smr & BIT(31)) || (smr & 0xffff) != sid) {
-		pr_emerg("rg55g1: USB SMR[%d] write rejected smr=0x%x\n",
-			 usb_idx, smr);
+	/* MMC first (lower SMR slots), then USB. */
+	ret = rg55g1_smmu_install_exact(smmu, numsmr, 0x140, want_s2cr, "SD");
+	if (ret < 0)
+		pr_emerg("rg55g1: SD SID install failed %d\n", ret);
+	ret = rg55g1_smmu_install_exact(smmu, numsmr, 0x560, want_s2cr, "eMMC");
+	if (ret < 0)
+		pr_emerg("rg55g1: eMMC SID install failed %d\n", ret);
+	ret = rg55g1_smmu_install_exact(smmu, numsmr, 0x540, want_s2cr, "USB");
+	if (ret < 0) {
+		pr_emerg("rg55g1: USB SID install failed %d\n", ret);
 		rg55g1_status("SMMU-SMR!", 0x00ff8000);
 		iounmap(smmu);
-		return -EPERM;
+		return ret;
 	}
 
-	pr_emerg("rg55g1: SMMU USB SMR[%d]=0x%x s2cr=0x%x cb=%u sCR0=0x%x\n",
-		 usb_idx, smr, s2cr, cbndx, scr0);
+	pr_emerg("rg55g1: SMMU bypass cb=%u sCR0=0x%x\n", cbndx, scr0);
 	rg55g1_status("SMMU-BYP", 0x0000ff00);
 	iounmap(smmu);
 	return 0;
+}
+
+/**
+ * rg55g1_bringup_mmc() - create SDHCI platform devices after GCC is up.
+ *
+ * Stock Android clock indices differ from mainline sm4450-gcc.h; rewrite
+ * clocks/resets, strip iommu/icc/regulator deps that cause probe defer.
+ */
+static int rg55g1_bringup_mmc(void)
+{
+	struct device_node *soc, *child, *gcc;
+	u32 gcc_ph = 0;
+	int n = 0;
+
+	rg55g1_status("MMC-PREP", 0x00ff8000);
+	(void)rg55g1_enable_sd_rails();
+
+	gcc = of_find_compatible_node(NULL, NULL, "qcom,sm4450-gcc");
+	if (!gcc)
+		gcc = of_find_compatible_node(NULL, NULL, "qcom,ravelin-gcc");
+	if (gcc) {
+		gcc_ph = gcc->phandle;
+		of_node_put(gcc);
+	}
+
+	soc = of_find_node_by_path("/soc");
+	if (!soc) {
+		rg55g1_status("MMC-NOSOC", 0x00ff0000);
+		return -ENODEV;
+	}
+
+	for_each_child_of_node(soc, child) {
+		bool emmc;
+		u32 clocks[4], resets[2];
+
+		if (!rg55g1_is_sdhci(child))
+			continue;
+
+		emmc = child->full_name &&
+		       (strstr(child->full_name, "7c4000") ||
+			strstr(child->full_name, "7C4000"));
+
+		/* RG55G1 has SD slot only — no soldered eMMC. */
+		if (emmc) {
+			rg55g1_force_status(child, "disabled");
+			continue;
+		}
+
+		rg55g1_force_status(child, "okay");
+		rg55g1_remove_prop(child, "non-removable");
+		/*
+		 * Poll-based CD (broken-cd): SDHCI_QUIRK_BROKEN_CARD_DETECTION
+		 * also sets MMC_CAP_NEEDS_POLL. Card presence is checked by
+		 * CMD13; yank is reported as "card removed" then re-probed.
+		 * cd-gpios need TLMM/pinctrl which we strip to avoid defer.
+		 */
+		rg55g1_set_string_prop(child, "broken-cd", "");
+		rg55g1_set_string_prop(child, "qcom,force-pio", "");
+
+		/* Avoid -EPROBE_DEFER on missing providers. */
+		rg55g1_remove_prop(child, "iommus");
+		rg55g1_remove_prop(child, "qcom,iommu-dma");
+		rg55g1_remove_prop(child, "qcom,iommu-dma-addr-pool");
+		rg55g1_remove_prop(child, "qcom,iommu-geometry");
+		rg55g1_remove_prop(child, "interconnects");
+		rg55g1_remove_prop(child, "interconnect-names");
+		rg55g1_remove_prop(child, "operating-points-v2");
+		rg55g1_remove_prop(child, "supports-cqe");
+		rg55g1_remove_prop(child, "vdd-supply");
+		rg55g1_remove_prop(child, "vdd-io-supply");
+		rg55g1_remove_prop(child, "vdd-en-dis-supply");
+		rg55g1_remove_prop(child, "vdd-io-en-dis-supply");
+		/* Keep dtbo vmmc/vqmmc if present; strip Android-only names. */
+		rg55g1_remove_prop(child, "vmmc-supply");
+		rg55g1_remove_prop(child, "vqmmc-supply");
+		rg55g1_remove_prop(child, "pinctrl-0");
+		rg55g1_remove_prop(child, "pinctrl-1");
+		rg55g1_remove_prop(child, "pinctrl-names");
+		rg55g1_remove_prop(child, "cd-gpios");
+		rg55g1_remove_prop(child, "qcom,dll-hsr-list");
+		rg55g1_remove_prop(child, "qcom,ice-clk-rates");
+		rg55g1_remove_prop(child, "qcom,devfreq,freq-table");
+		/* Limit init speed until regulators/pinctrl are wired. */
+		rg55g1_set_u32_prop(child, "max-frequency", 50000000);
+
+		if (gcc_ph) {
+			clocks[0] = gcc_ph;
+			clocks[1] = GCC_SDCC2_AHB_CLK;
+			clocks[2] = gcc_ph;
+			clocks[3] = GCC_SDCC2_APPS_CLK;
+			resets[0] = gcc_ph;
+			resets[1] = GCC_SDCC2_BCR;
+			rg55g1_set_u32_array_prop(child, "clocks", clocks, 4);
+			rg55g1_set_u32_array_prop(child, "resets", resets, 2);
+			/* clock-names = "iface", "core" */
+			{
+				static const char names[] = "iface\0core";
+				struct property *pp;
+				char *val;
+
+				val = kmemdup(names, sizeof(names), GFP_KERNEL);
+				if (val) {
+					pp = kzalloc(sizeof(*pp), GFP_KERNEL);
+					if (pp) {
+						pp->name = "clock-names";
+						pp->length = sizeof(names);
+						pp->value = val;
+						of_update_property(child, pp);
+					} else {
+						kfree(val);
+					}
+				}
+			}
+			rg55g1_set_string_prop(child, "reset-names",
+						"core_reset");
+		}
+
+		if (!of_platform_device_create(child, NULL, NULL)) {
+			struct platform_device *exist =
+				of_find_device_by_node(child);
+
+			if (exist) {
+				put_device(&exist->dev);
+				n++;
+				pr_emerg("rg55g1: already-up %pOF\n", child);
+			} else {
+				pr_emerg("rg55g1: mmc create failed for %pOF\n",
+					 child);
+			}
+		} else {
+			n++;
+			pr_emerg("rg55g1: populated %pOF (%s)\n", child,
+				 emmc ? "eMMC" : "SD");
+		}
+	}
+	of_node_put(soc);
+
+	rg55g1_status(n ? "MMC-DEV" : "MMC-NONE",
+		      n ? 0x0000ff00 : 0x00ff0000);
+	return n;
 }
 
 /**
@@ -1491,6 +1697,8 @@ int rg55g1_bringup_usb(void)
 				continue;
 			if (is_gcc)
 				continue; /* already created */
+			if (rg55g1_is_sdhci(child))
+				continue; /* created in rg55g1_bringup_mmc() */
 			if (pass == 0 && is_dwc)
 				continue;
 			if (pass == 1 && !is_dwc)
@@ -1549,6 +1757,13 @@ int rg55g1_bringup_usb(void)
 	/* Kick keepalive immediately with fresh writes */
 	if (vbus_keep_ctrl)
 		mod_delayed_work(system_wq, &vbus_keep_work, 0);
+
+	/* SDHCI after GCC/SMMU so iface/core clocks and phys DMA work. */
+	n += rg55g1_bringup_mmc();
+	driver_deferred_probe_trigger();
+	msleep(500);
+	driver_deferred_probe_trigger();
+	msleep(500);
 
 	rg55g1_status(n ? "USB-DEV" : "USB-NONE", n ? 0x0000ff00 : 0x00ff0000);
 	return n;

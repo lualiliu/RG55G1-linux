@@ -706,7 +706,7 @@ void devm_led_classdev_unregister(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(devm_led_classdev_unregister);
 
-static int __init leds_init(void)
+int __init leds_init(void)
 {
 	leds_wq = alloc_ordered_workqueue("leds", 0);
 	if (!leds_wq) {

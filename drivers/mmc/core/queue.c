@@ -504,8 +504,12 @@ void mmc_cleanup_queue(struct mmc_queue *mq)
 	/*
 	 * The legacy code handled the possibility of being suspended,
 	 * so do that here too.
+	 *
+	 * Guard NULL q: on RG55G1 surprise-removal, del_gendisk may have
+	 * already torn the queue down while mq->queue was cleared/raced.
+	 * blk_queue_quiesced(NULL) would deref queue_flags at offset 0x20.
 	 */
-	if (blk_queue_quiesced(q))
+	if (q && blk_queue_quiesced(q))
 		blk_mq_unquiesce_queue(q);
 
 	/*
@@ -524,6 +528,7 @@ void mmc_cleanup_queue(struct mmc_queue *mq)
 	 */
 	flush_work(&mq->complete_work);
 
+	mq->queue = NULL;
 	mq->card = NULL;
 }
 

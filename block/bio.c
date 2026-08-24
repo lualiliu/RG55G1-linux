@@ -1987,7 +1987,7 @@ bad:
 }
 EXPORT_SYMBOL(bioset_init);
 
-static int __init init_bio(void)
+int __init init_bio(void)
 {
 	int i;
 

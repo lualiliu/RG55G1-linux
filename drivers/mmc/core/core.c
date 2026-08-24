@@ -2422,7 +2422,7 @@ static void __exit mmc_exit(void)
 	mmc_unregister_bus();
 }
 
-subsys_initcall(mmc_init);
+arch_initcall(mmc_init); /* RG55G1: mmc core without full subsys level */
 module_exit(mmc_exit);
 
 MODULE_DESCRIPTION("MMC core driver");
