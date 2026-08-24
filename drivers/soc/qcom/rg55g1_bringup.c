@@ -1766,6 +1766,14 @@ int rg55g1_bringup_usb(void)
 	msleep(500);
 
 	rg55g1_status(n ? "USB-DEV" : "USB-NONE", n ? 0x0000ff00 : 0x00ff0000);
+	pr_emerg("rg55g1: USB bringup done: %d platform devs (see top VBUS line)\n",
+		 n);
+	{
+		char sum[24];
+
+		snprintf(sum, sizeof(sum), n ? "USB+%d" : "USB-0", n);
+		rg55g1_status(sum, n ? 0x0000ff00 : 0x00ff0000);
+	}
 	return n;
 }
 EXPORT_SYMBOL_GPL(rg55g1_bringup_usb);
@@ -1782,4 +1790,4 @@ static int __init rg55g1_bringup_early_flags(void)
 	rg55g1_skip_of_populate = true;
 	return 0;
 }
-pure_initcall(rg55g1_bringup_early_flags);
+early_initcall(rg55g1_bringup_early_flags);

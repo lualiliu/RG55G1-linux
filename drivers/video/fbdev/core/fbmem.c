@@ -743,6 +743,16 @@ MODULE_DESCRIPTION("Framebuffer base");
 subsys_initcall(fbmem_init);
 #endif
 
+/*
+ * RG55G1 skips subsys initcalls; fbcon needs fbmem before register_framebuffer.
+ */
+int __init rg55g1_fbmem_ensure(void)
+{
+	if (fb_class)
+		return 0;
+	return fbmem_init();
+}
+
 int fb_new_modelist(struct fb_info *info)
 {
 	struct fb_var_screeninfo var = info->var;

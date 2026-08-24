@@ -28,6 +28,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/regulator/consumer.h>
+#include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <asm/cacheflush.h>
 
@@ -273,13 +274,94 @@ static int rg55_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
 	return 0;
 }
 
+/* Push shadow bytes [p, p+len) to panel (console sits below status strip). */
+static void rg55_flush_bytes(struct fb_info *info, unsigned long p, size_t len)
+{
+	u32 line = info->fix.line_length;
+	u32 bpp = info->var.bits_per_pixel / 8;
+	unsigned long end;
+	u32 y0, y1, x0, x1;
+
+	if (!len || !info->screen_base)
+		return;
+
+	end = p + len;
+	if (end > info->screen_size)
+		end = info->screen_size;
+	if (end <= p)
+		return;
+
+	y0 = (u32)(p / line);
+	x0 = (u32)((p % line) / bpp);
+	y1 = (u32)((end - 1) / line);
+	x1 = (u32)(((end - 1) % line) / bpp) + 1;
+
+	if (x0 == 0 && x1 >= info->var.xres)
+		rg55_flush_rect_tiled(info, 0, y0, info->var.xres, y1 - y0 + 1);
+	else
+		rg55_flush_rect_tiled(info, x0, y0, x1 - x0, y1 - y0 + 1);
+}
+
+static int rg55_fb_sync(struct fb_info *info)
+{
+	rg55_flush_rect_tiled(info, 0, 0, info->var.xres, info->var.yres);
+	return 0;
+}
+
+static int rg55_fb_pan_display(struct fb_var_screeninfo *var,
+			       struct fb_info *info)
+{
+	info->var.xoffset = var->xoffset;
+	info->var.yoffset = var->yoffset;
+	rg55_fb_sync(info);
+	return 0;
+}
+
+static ssize_t rg55_fb_write(struct fb_info *info, const char __user *buf,
+			     size_t count, loff_t *ppos)
+{
+	unsigned long p = *ppos;
+	unsigned long total_size;
+	size_t written;
+	int err = 0;
+
+	if (!(info->flags & FBINFO_VIRTFB) || !info->screen_base)
+		return -ENODEV;
+
+	total_size = info->screen_size;
+	if (!total_size)
+		total_size = info->fix.smem_len;
+
+	if (p > total_size)
+		return -EFBIG;
+
+	if (count > total_size - p) {
+		count = total_size - p;
+		if (!count)
+			return -ENOSPC;
+		err = -ENOSPC;
+	}
+
+	if (copy_from_user(info->screen_base + p, buf, count))
+		return -EFAULT;
+
+	written = count;
+	rg55_flush_bytes(info, p, written);
+
+	*ppos += written;
+	return written ? (ssize_t)written : err;
+}
+
 static const struct fb_ops rg55_splash_ops = {
 	.owner		= THIS_MODULE,
-	__FB_DEFAULT_SYSMEM_OPS_RDWR,
+	.fb_read	= fb_sys_read,
+	.fb_write	= rg55_fb_write,
 	.fb_check_var	= rg55_check_var,
+	.fb_pan_display	= rg55_fb_pan_display,
 	.fb_fillrect	= rg55_fillrect,
 	.fb_copyarea	= rg55_copyarea,
 	.fb_imageblit	= rg55_imageblit,
+	.fb_sync	= rg55_fb_sync,
 	.fb_destroy	= simplefb_destroy,
 	.fb_setcolreg	= simplefb_setcolreg,
 };
@@ -346,11 +428,24 @@ static void rg55_hw_puts2x(void *hw, u32 x, u32 y, const char *s, u32 fg, u32 bg
 	}
 }
 
+static u32 rg55_status_fg(u32 bg)
+{
+	u32 r = (bg >> 16) & 0xff;
+	u32 g = (bg >> 8) & 0xff;
+	u32 b = bg & 0xff;
+
+	/* White/light backgrounds need dark glyphs (EXEC-INIT was unreadable). */
+	if (r * 299 + g * 587 + b * 114 > 128000)
+		return 0x00000000;
+	return 0x00ffffff;
+}
+
 static void rg55_repaint_status(void)
 {
 	void *hw = rg55g1_splash_hw;
 	unsigned int i;
 	char buf[28];
+	u32 fg;
 
 	if (!hw)
 		return;
@@ -358,14 +453,16 @@ static void rg55_repaint_status(void)
 	/* Sticky VBUS on row 0 */
 	rg55_hw_bar(hw, 0, RG55_LINE_H, rg55_vbus_color);
 	snprintf(buf, sizeof(buf), "0 %s", rg55_vbus_sticky);
-	rg55_hw_puts2x(hw, 16, 0, buf, 0x00ffffff, rg55_vbus_color);
+	fg = rg55_status_fg(rg55_vbus_color);
+	rg55_hw_puts2x(hw, 16, 0, buf, fg, rg55_vbus_color);
 
 	for (i = 0; i < rg55_status_slot && i < RG55_STATUS_ROWS - 1; i++) {
 		u32 y = (i + 1) * RG55_LINE_H;
 
 		rg55_hw_bar(hw, y, RG55_LINE_H, rg55_status_color[i]);
 		snprintf(buf, sizeof(buf), "%u %s", i + 1, rg55_status_msg[i]);
-		rg55_hw_puts2x(hw, 16, y, buf, 0x00ffffff, rg55_status_color[i]);
+		fg = rg55_status_fg(rg55_status_color[i]);
+		rg55_hw_puts2x(hw, 16, y, buf, fg, rg55_status_color[i]);
 	}
 	rg55_sync_hw(hw, 0, RG55_STATUS_H);
 }
@@ -1001,9 +1098,13 @@ static struct platform_driver simplefb_driver = {
 module_platform_driver(simplefb_driver);
 
 /*
- * RG55G1: must NOT register FB from console_initcall — console_lock is held
- * and fbcon takeover deadlocks. early_initcall runs after console_init.
+ * RG55G1: map splash FB early for status strip; register /dev/fb0 later.
+ * register_framebuffer() must run after fbmem_init (subsys_initcall), otherwise
+ * fb_class is NULL and no fb0 device node appears under devtmpfs.
+ * Must NOT register from console_initcall — console_lock deadlock with fbcon.
  */
+static struct fb_info *rg55g1_pending_fb;
+
 static int __init rg55g1_splash_console_init(void)
 {
 	struct fb_info *info;
@@ -1104,17 +1205,33 @@ static int __init rg55g1_splash_console_init(void)
 	}
 
 	rg55_status_slot = 0;
-	rg55g1_status("FB-MAP", 0x00ffffff);
+	rg55g1_status("FB-MAP", 0x00404040);
 	rg55g1_status("READY", 0x00ffff00);
 	rg55g1_status_vbus("VBUS:wait", 0x00808080);
+	rg55g1_pending_fb = info;
+	return 0;
+}
+early_initcall(rg55g1_splash_console_init);
+
+static int rg55g1_splash_fbdev_register(void)
+{
+	struct fb_info *info = rg55g1_pending_fb;
+
+	if (!info)
+		return 0;
+
+	rg55g1_pending_fb = NULL;
 
 	if (register_framebuffer(info) < 0) {
+		struct simplefb_par *par = info->par;
+
 		rg55g1_splash_hw = NULL;
 		rg55g1_splash_info = NULL;
-		vfree(shadow);
-		memunmap(hw);
+		vfree(info->screen_base);
+		if (par->hw_base)
+			memunmap(par->hw_base);
 		framebuffer_release(info);
-		return 0;
+		return -EIO;
 	}
 
 	rg55g1_status("FB-REG", 0x0000ff00);
@@ -1126,10 +1243,34 @@ static int __init rg55g1_splash_console_init(void)
 		rg55g1_sanitize_dt();
 	}
 	rg55g1_status("DT-OK", 0x00ff00ff);
-	pr_emerg("rg55g1: console ready, boot continues toward ash\n");
+	pr_emerg("rg55g1: /dev/fb0 ready, boot continues toward ash\n");
 	return 0;
 }
-early_initcall(rg55g1_splash_console_init);
+
+static int __init rg55g1_splash_fbdev_init(void)
+{
+	return rg55g1_splash_fbdev_register();
+}
+fs_initcall(rg55g1_splash_fbdev_init);
+
+/*
+ * Truncated initcall path skips fs/subsys levels; register fb0 + fbcon here.
+ */
+int __init rg55g1_fbmem_ensure(void);
+
+int __init rg55g1_splash_fbdev_bringup(void)
+{
+	int ret;
+
+	if (!rg55g1_pending_fb)
+		return 0;
+
+	ret = rg55g1_fbmem_ensure();
+	if (ret)
+		return ret;
+
+	return rg55g1_splash_fbdev_register();
+}
 
 MODULE_AUTHOR("Stephen Warren <swarren@wwwdotorg.org>");
 MODULE_DESCRIPTION("Simple framebuffer driver");

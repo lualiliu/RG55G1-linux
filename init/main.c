@@ -1438,6 +1438,13 @@ static void __init do_initcalls(void)
 			strcpy(command_line, saved_command_line);
 			do_initcall_level(level, command_line);
 		}
+		{
+			extern int __init rg55g1_splash_fbdev_bringup(void);
+
+			rg55g1_status("FB-BRING", 0x00ff8000);
+			if (rg55g1_splash_fbdev_bringup())
+				rg55g1_status("FB-!", 0x00ff0000);
+		}
 		rg55g1_status("SKIP-SUB0", 0x00ff00ff);
 		rg55g1_force_populate_rootfs();
 
@@ -1635,8 +1642,10 @@ static int __ref kernel_init(void *unused)
 
 	{
 		extern void rg55g1_status(const char *msg, u32 color);
+		extern int rg55g1_vbus_refresh(void);
 
-		rg55g1_status("EXEC-INIT", 0x00ffffff);
+		(void)rg55g1_vbus_refresh();
+		rg55g1_status("EXEC-INIT", 0x00204060);
 	}
 
 	if (ramdisk_execute_command) {

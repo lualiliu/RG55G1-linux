@@ -173,7 +173,7 @@ static bool driver_deferred_probe_enable;
  * changes in the midst of a probe, then deferred processing should be triggered
  * again.
  */
-bool rg55g1_block_deferred;
+bool rg55g1_block_deferred = true;
 EXPORT_SYMBOL_GPL(rg55g1_block_deferred);
 
 void rg55g1_dump_deferred_pending(void)
