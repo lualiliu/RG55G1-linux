@@ -1235,7 +1235,19 @@ static struct platform_driver spi_geni_driver = {
 		.of_match_table = spi_geni_dt_match,
 	},
 };
-module_platform_driver(spi_geni_driver);
+
+static int __init spi_geni_driver_init(void)
+{
+	return platform_driver_register(&spi_geni_driver);
+}
+/* RG55G1 skips device_initcall (LV4+); need SPI before joypad MCU probe. */
+arch_initcall(spi_geni_driver_init);
+
+static void __exit spi_geni_driver_exit(void)
+{
+	platform_driver_unregister(&spi_geni_driver);
+}
+module_exit(spi_geni_driver_exit);
 
 MODULE_DESCRIPTION("SPI driver for GENI based QUP cores");
 MODULE_LICENSE("GPL v2");

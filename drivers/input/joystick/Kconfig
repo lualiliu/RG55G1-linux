@@ -412,6 +412,18 @@ config JOYSTICK_SENSEHAT
 	  To compile this driver as a module, choose M here: the
 	  module will be called sensehat_joystick.
 
+config JOYSTICK_SINGLE_ADC
+	tristate "Anbernic single-ADC / MCU SPI gamepad"
+	depends on OF
+	depends on SPI
+	select QCOM_GENI_SE
+	help
+	  GPIO digital buttons plus optional SPI MCU analog sticks for
+	  Anbernic handhelds (compatible = "singleadc-joypad").
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called singleadc-joypad.
+
 config JOYSTICK_SEESAW
 	tristate "Adafruit Mini I2C Gamepad with Seesaw"
 	depends on I2C

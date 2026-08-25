@@ -1914,21 +1914,35 @@ static void rg55g1_bringup_scm(void)
 {
 	struct device_node *np;
 	struct platform_device *pdev;
+	int tries;
 
 	np = of_find_compatible_node(NULL, NULL, "qcom,scm");
-	if (!np)
+	if (!np) {
+		pr_emerg("rg55g1: qcom,scm DT node missing\n");
 		return;
+	}
 
 	rg55g1_force_status(np, "okay");
+	/* Flattened stock phandle may break of_address_to_resource. */
+	rg55g1_remove_prop(np, "qcom,dload-mode");
+	rg55g1_remove_prop(np, "interconnects");
+	rg55g1_remove_prop(np, "interconnect-names");
+
 	pdev = of_find_device_by_node(np);
 	if (pdev) {
 		put_device(&pdev->dev);
+		pr_emerg("rg55g1: scm already present\n");
 	} else if (!of_platform_device_create(np, NULL, NULL)) {
 		pr_emerg("rg55g1: scm create failed\n");
 	} else {
 		pr_emerg("rg55g1: scm created\n");
-		msleep(200);
 	}
+
+	for (tries = 0; tries < 20 && !qcom_scm_is_available(); tries++) {
+		driver_deferred_probe_trigger();
+		msleep(50);
+	}
+	pr_emerg("rg55g1: scm available=%d\n", qcom_scm_is_available());
 	of_node_put(np);
 }
 
@@ -2291,6 +2305,176 @@ static int rg55g1_bringup_mmc(void)
 	return n;
 }
 
+static int rg55g1_create_of_dev(struct device_node *np, const char *tag)
+{
+	if (!np)
+		return 0;
+
+	rg55g1_force_status(np, "okay");
+	if (!of_platform_device_create(np, NULL, NULL)) {
+		struct platform_device *exist = of_find_device_by_node(np);
+
+		if (exist) {
+			put_device(&exist->dev);
+			pr_emerg("rg55g1: already-up %s %pOF\n", tag, np);
+			return 1;
+		}
+		pr_emerg("rg55g1: create failed %s %pOF\n", tag, np);
+		return 0;
+	}
+	pr_emerg("rg55g1: populated %s %pOF\n", tag, np);
+	return 1;
+}
+
+/**
+ * rg55g1_bringup_joypad() - clocks/pinmux + singleadc-joypad for /dev/input
+ *
+ * Do not probe qcom,sm4450-tlmm (gpiochip panics). Buttons + MCU SPI use
+ * direct TLMM/GENI MMIO inside the joypad driver — skip full spi-geni
+ * platform probe (firmware/ICC hang on this bring-up).
+ */
+static void rg55g1_enable_qup0_clks(void)
+{
+	void __iomem *gcc;
+	u32 val;
+
+	/* Voted branch enables in GCC_APCS_CLOCK_BRANCH_ENA_VOTE (0x62008) */
+	gcc = ioremap(0x00100000, 0xa0000);
+	if (!gcc)
+		return;
+
+	val = readl_relaxed(gcc + 0x62008);
+	val |= BIT(6) | BIT(7) |	/* wrap_0 m/s ahb */
+	       BIT(8) | BIT(9) |	/* wrap0 core / core_2x */
+	       BIT(13);			/* wrap0_s3 */
+	writel_relaxed(val, gcc + 0x62008);
+	/* Ensure branch CBCR leave halt (set CLK_ENABLE bit0 if present) */
+	writel_relaxed(readl_relaxed(gcc + 0x27004) | BIT(0), gcc + 0x27004);
+	writel_relaxed(readl_relaxed(gcc + 0x27008) | BIT(0), gcc + 0x27008);
+	writel_relaxed(readl_relaxed(gcc + 0x33000) | BIT(0), gcc + 0x33000);
+	writel_relaxed(readl_relaxed(gcc + 0x3300c) | BIT(0), gcc + 0x3300c);
+	writel_relaxed(readl_relaxed(gcc + 0x273a8) | BIT(0), gcc + 0x273a8);
+
+	/*
+	 * Force S3 RCG to 19.2 MHz (TCXO): CMD_RCGR@0x273b0 CFG=div1 src0.
+	 * Leave M/N/D at 0 for integer mode.
+	 */
+	writel_relaxed(0x1, gcc + 0x273b4);		/* CFG_RCGR */
+	writel_relaxed(0x1, gcc + 0x273b0);		/* CMD update */
+	iounmap(gcc);
+	pr_emerg("rg55g1: QUP0 clocks voted (s3 @19.2M for joy SPI)\n");
+}
+
+static void rg55g1_tlmm_scm_mux_spi_se3(void)
+{
+	/*
+	 * gpio18-21 → qup0_se3 (mux=1). Match stock SPI active:
+	 * drive-strength=6 (code 2), bias-pull-down, OE clear.
+	 */
+	static const int pins[] = { 18, 19, 20, 21 };
+	void __iomem *tlmm;
+	int i, ok = 0;
+
+	tlmm = ioremap(0x0f100000UL, 0x300000UL);
+	if (!tlmm) {
+		pr_emerg("rg55g1: TLMM ioremap failed for SPI mux\n");
+		return;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(pins); i++) {
+		u32 ctl = readl_relaxed(tlmm + pins[i] * 0x1000);
+
+		ctl &= ~((0x7 << 2) | 0x3 | (0x7 << 6) | BIT(9));
+		ctl |= (1 << 2);	/* mux qup0_se3 */
+		ctl |= 0x1;		/* pull-down */
+		ctl |= (2 << 6);	/* drive 6 mA */
+		writel_relaxed(ctl, tlmm + pins[i] * 0x1000);
+		ok++;
+	}
+	iounmap(tlmm);
+	pr_emerg("rg55g1: SPI SE3 pins muxed (%d/4) drv=6 PD base=0xf100000\n",
+		 ok);
+}
+
+/* Hall(42) + MCU 3V3(95) + RGB(41) — MCU must be powered for SPI ADC. */
+static void rg55g1_joypad_mcu_power(void)
+{
+	static const int pins[] = { 42, 95, 41 };
+	void __iomem *tlmm;
+	int i;
+
+	tlmm = ioremap(0x0f100000UL, 0x300000UL);
+	if (!tlmm)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(pins); i++) {
+		u32 ctl = readl_relaxed(tlmm + pins[i] * 0x1000);
+
+		ctl &= ~((0x7 << 2) | 0x3);
+		ctl |= BIT(9); /* OE output */
+		writel_relaxed(ctl, tlmm + pins[i] * 0x1000);
+		writel_relaxed(BIT(1), tlmm + pins[i] * 0x1000 + 0x4); /* OUT */
+	}
+	iounmap(tlmm);
+	msleep(80);
+	pr_emerg("rg55g1: joypad MCU/hall/rgb power GPIOs driven high\n");
+}
+
+static int rg55g1_bringup_joypad(void)
+{
+	struct device_node *joy, *stock_spi, *stock_i2c;
+	int n = 0;
+
+	rg55g1_status("JOY-PREP", 0x00ff8000);
+
+	rg55g1_enable_qup0_clks();
+	rg55g1_tlmm_scm_mux_spi_se3();
+	rg55g1_joypad_mcu_power();
+
+	/* Keep stock SE3 siblings from fighting pinmux. */
+	stock_spi = of_find_node_by_path("/soc/spi@98c000");
+	if (stock_spi) {
+		rg55g1_force_status(stock_spi, "disabled");
+		of_node_put(stock_spi);
+	}
+	stock_i2c = of_find_node_by_path("/soc/i2c@98c000");
+	if (stock_i2c) {
+		rg55g1_force_status(stock_i2c, "disabled");
+		of_node_put(stock_i2c);
+	}
+
+	/*
+	 * Skip geni-se-qup / qcom,geni-spi platform devices: probe needs
+	 * SE ELF firmware + ICC and previously hung bring-up. Joypad talks
+	 * to SE3 via polled GENI FIFO MMIO when BL left SPI protocol loaded.
+	 */
+	rg55g1_status("JOY-SPI", 0x00ffff00);
+	pr_emerg("rg55g1: SPI via joypad GENI MMIO (no spi-geni probe)\n");
+
+	joy = of_find_compatible_node(NULL, NULL, "singleadc-joypad");
+	if (!joy) {
+		rg55g1_status("JOY-NODT", 0x00ff0000);
+		pr_emerg("rg55g1: singleadc-joypad DT node missing\n");
+		return n;
+	}
+
+	/* No TLMM pinctrl driver — strip so probe does not defer. */
+	rg55g1_remove_prop(joy, "pinctrl-0");
+	rg55g1_remove_prop(joy, "pinctrl-names");
+
+	rg55g1_status("JOY-DEV", 0x00ffff00);
+	n += rg55g1_create_of_dev(joy, "joypad");
+	of_node_put(joy);
+
+	driver_deferred_probe_trigger();
+	msleep(100);
+
+	rg55g1_status(n ? "JOY-OK" : "JOY-FAIL",
+		      n ? 0x0000ff00 : 0x00ff0000);
+	pr_emerg("rg55g1: joypad bringup done (%d)\n", n);
+	return n;
+}
+
 /**
  * rg55g1_bringup_usb() - create GCC + USB platform devices for HID keyboard.
  */
@@ -2446,6 +2630,9 @@ int rg55g1_bringup_usb(void)
 	msleep(500);
 	driver_deferred_probe_trigger();
 	msleep(500);
+
+	/* Gamepad after GCC clocks are available for GENI SPI. */
+	n += rg55g1_bringup_joypad();
 
 	rg55g1_status(n ? "USB-DEV" : "USB-NONE", n ? 0x0000ff00 : 0x00ff0000);
 	pr_emerg("rg55g1: USB bringup done: %d platform devs (see top VBUS line)\n",

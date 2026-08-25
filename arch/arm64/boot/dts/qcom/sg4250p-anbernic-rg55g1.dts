@@ -16661,3 +16661,5 @@
 		qmi_sensor = "/soc/qmi-ts-sensors";
 	};
 };
+
+#include "sg4250p-anbernic-rg55g1-joypad.dtsi"

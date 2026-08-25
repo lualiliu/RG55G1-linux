@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * RG55G1 retrogame joypad fragment (from stock ravelin-pmic-overlay).
+ * Path references work against the stock flattened DTB.
+ */
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/linux-event-codes.h>
+#include <dt-bindings/clock/qcom,sm4450-gcc.h>
+
+/* Keep stock SE3 siblings disabled; mainline SPI lives under GENI wrapper. */
+&{/soc/spi@98c000} {
+	status = "disabled";
+};
+
+&{/soc/i2c@98c000} {
+	status = "disabled";
+};
+
+&{/soc/pinctrl@f000000} {
+	gpio_joypad: gpio-joypad {
+		pins = "gpio35", "gpio52", "gpio57", "gpio58",
+		       "gpio26", "gpio8", "gpio9", "gpio91",
+		       "gpio33", "gpio47", "gpio60", "gpio27",
+		       "gpio59", "gpio90", "gpio28", "gpio34";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	/* Power / enable lines driven as outputs by the driver */
+	gpio_joypad_pwr: gpio-joypad-pwr {
+		pins = "gpio42", "gpio95", "gpio41";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+};
+
+/*
+ * Mainline expects SPI as a child of geni-se-qup. Stock places SPI as a
+ * /soc sibling with qcom,wrapper-core; re-home SE3 SPI under the wrapper.
+ */
+&{/soc/qcom,qupv3_0_geni_se@9c0000} {
+	compatible = "qcom,geni-se-qup";
+	#address-cells = <1>;
+	#size-cells = <1>;
+	ranges;
+	clock-names = "m-ahb", "s-ahb";
+	clocks = <&{/soc/clock-controller@100000} GCC_QUPV3_WRAP_0_M_AHB_CLK>,
+		 <&{/soc/clock-controller@100000} GCC_QUPV3_WRAP_0_S_AHB_CLK>;
+	/delete-property/ interconnects;
+	/delete-property/ interconnect-names;
+	/delete-property/ iommus;
+	/delete-property/ qcom,msm-bus,num-paths;
+	/delete-property/ qcom,iommu-dma-addr-pool;
+	/delete-property/ qcom,iommu-geometry;
+	/delete-property/ qcom,iommu-dma;
+	status = "okay";
+
+	spi@98c000 {
+		compatible = "qcom,geni-spi";
+		reg = <0x98c000 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		interrupts = <0 604 4>;
+		clock-names = "se";
+		clocks = <&{/soc/clock-controller@100000} GCC_QUPV3_WRAP0_S3_CLK>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&{/soc/pinctrl@f000000/qupv3_se3_spi_pins/qupv3_se3_spi_mosi_active}
+			     &{/soc/pinctrl@f000000/qupv3_se3_spi_pins/qupv3_se3_spi_miso_active}
+			     &{/soc/pinctrl@f000000/qupv3_se3_spi_pins/qupv3_se3_spi_clk_active}
+			     &{/soc/pinctrl@f000000/qupv3_se3_spi_pins/qupv3_se3_spi_cs_active}>;
+		status = "okay";
+
+		spi_joystick: spi-joystick@0 {
+			compatible = "mcu,spi_joystick";
+			reg = <0>;
+			spi-max-frequency = <1400000>;
+		};
+	};
+};
+
+&{/soc} {
+	singleadc_joypad: singleadc-joypad {
+		compatible = "singleadc-joypad";
+		status = "okay";
+		joypad-name = "retrogame_joypad";
+		joypad-product = <0x1101>;
+		joypad-revision = <0x0100>;
+		amux-count = <6>;
+		hall-power-ctl0-gpios = <&{/soc/pinctrl@f000000} 42 GPIO_ACTIVE_HIGH>;
+		mcu-3v3-power-ctl1-gpios = <&{/soc/pinctrl@f000000} 95 GPIO_ACTIVE_HIGH>;
+		rgb-power-gpios = <&{/soc/pinctrl@f000000} 41 GPIO_ACTIVE_HIGH>;
+		button-adc-scale = <1>;
+		button-adc-deadzone = <3200>;
+		button-adc-fuzz = <64>;
+		button-adc-flat = <64>;
+		abs_x-p-tuning = <100>;
+		abs_x-n-tuning = <100>;
+		abs_y-p-tuning = <100>;
+		abs_y-n-tuning = <100>;
+		abs_rx-p-tuning = <100>;
+		abs_rx-n-tuning = <100>;
+		abs_ry-p-tuning = <100>;
+		abs_ry-n-tuning = <100>;
+		abs_z-p-tuning = <200>;
+		abs_z-n-tuning = <200>;
+		abs_rz-p-tuning = <200>;
+		abs_rz-n-tuning = <200>;
+		poll-interval = <10>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&gpio_joypad &gpio_joypad_pwr>;
+
+		sw1 {
+			label = "GPIO DPAD-UP";
+			gpios = <&{/soc/pinctrl@f000000} 35 GPIO_ACTIVE_LOW>;
+			linux,code = <ABS_HAT0Y>;
+			linux,input-type = <EV_ABS>;
+			linux,abs-value = <2>;
+			debounce-interval = <2>;
+		};
+		sw2 {
+			label = "GPIO DPAD-DOWN";
+			gpios = <&{/soc/pinctrl@f000000} 52 GPIO_ACTIVE_LOW>;
+			linux,code = <ABS_HAT0Y>;
+			linux,input-type = <EV_ABS>;
+			linux,abs-value = <1>;
+			debounce-interval = <2>;
+		};
+		sw3 {
+			label = "GPIO DPAD-LEFT";
+			gpios = <&{/soc/pinctrl@f000000} 57 GPIO_ACTIVE_LOW>;
+			linux,code = <ABS_HAT0X>;
+			linux,input-type = <EV_ABS>;
+			linux,abs-value = <2>;
+			debounce-interval = <2>;
+		};
+		sw4 {
+			label = "Gamepad DPAD-RIGHT";
+			gpios = <&{/soc/pinctrl@f000000} 58 GPIO_ACTIVE_LOW>;
+			linux,code = <ABS_HAT0X>;
+			linux,input-type = <EV_ABS>;
+			linux,abs-value = <1>;
+			debounce-interval = <2>;
+		};
+		sw5 {
+			label = "GPIO BTN-Y";
+			gpios = <&{/soc/pinctrl@f000000} 26 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_WEST>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw6 {
+			label = "GPIO BTN-B";
+			gpios = <&{/soc/pinctrl@f000000} 8 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_EAST>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw7 {
+			label = "GPIO BTN-X";
+			gpios = <&{/soc/pinctrl@f000000} 9 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_NORTH>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw8 {
+			label = "GPIO BTN-A";
+			gpios = <&{/soc/pinctrl@f000000} 91 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_SOUTH>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw9 {
+			label = "GPIO BTN_SELECT";
+			gpios = <&{/soc/pinctrl@f000000} 33 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_SELECT>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw10 {
+			label = "GPIO BTN_START";
+			gpios = <&{/soc/pinctrl@f000000} 47 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_START>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw11 {
+			label = "GPIO BTN_LB";
+			gpios = <&{/soc/pinctrl@f000000} 60 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_TL>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw12 {
+			label = "GPIO BTN_RB";
+			gpios = <&{/soc/pinctrl@f000000} 27 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_TR>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw13 {
+			label = "GPIO BTN_THUMBL";
+			gpios = <&{/soc/pinctrl@f000000} 59 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_THUMBL>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw14 {
+			label = "GPIO BTN_THUMBR";
+			gpios = <&{/soc/pinctrl@f000000} 90 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_THUMBR>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw15 {
+			label = "GPIO BTN_MODE";
+			gpios = <&{/soc/pinctrl@f000000} 28 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_MODE>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+		sw16 {
+			label = "GPIO BTN_C";
+			gpios = <&{/soc/pinctrl@f000000} 34 GPIO_ACTIVE_LOW>;
+			linux,code = <BTN_C>;
+			linux,input-type = <EV_KEY>;
+			debounce-interval = <2>;
+		};
+	};
+};

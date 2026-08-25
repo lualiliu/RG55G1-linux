@@ -98,13 +98,13 @@ static int qcom_tzmem_init(void)
 	}
 
 	ret = qcom_scm_shm_bridge_enable(qcom_tzmem_dev);
-	if (ret == -EOPNOTSUPP)
+	if (ret) {
+		/* Bring-up / older TZ: treat any failure as "no bridge". */
 		goto notsupp;
+	}
 
-	if (!ret)
-		qcom_tzmem_using_shm_bridge = true;
-
-	return ret;
+	qcom_tzmem_using_shm_bridge = true;
+	return 0;
 
 notsupp:
 	dev_info(qcom_tzmem_dev, "SHM Bridge not supported\n");

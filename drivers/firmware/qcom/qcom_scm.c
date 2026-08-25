@@ -1137,8 +1137,8 @@ int qcom_scm_io_readl(phys_addr_t addr, unsigned int *val)
 	struct qcom_scm_res res;
 	int ret;
 
-
-	ret = qcom_scm_call_atomic(__scm->dev, &desc, &res);
+	/* IO uses register args only; allow early calls before __scm probe. */
+	ret = qcom_scm_call_atomic(__scm ? __scm->dev : NULL, &desc, &res);
 	if (ret >= 0)
 		*val = res.result[0];
 
@@ -1157,7 +1157,7 @@ int qcom_scm_io_writel(phys_addr_t addr, unsigned int val)
 		.owner = ARM_SMCCC_OWNER_SIP,
 	};
 
-	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
+	return qcom_scm_call_atomic(__scm ? __scm->dev : NULL, &desc, NULL);
 }
 EXPORT_SYMBOL_GPL(qcom_scm_io_writel);
 
@@ -2983,7 +2983,11 @@ static int __init qcom_scm_init(void)
 {
 	return platform_driver_register(&qcom_scm_driver);
 }
-subsys_initcall(qcom_scm_init);
+/*
+ * RG55G1 only runs pure..arch initcalls (skips LV4+). SCM must be available
+ * before USB/joypad bring-up uses qcom_scm_io_*.
+ */
+arch_initcall(qcom_scm_init);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. SCM driver");
 MODULE_LICENSE("GPL v2");

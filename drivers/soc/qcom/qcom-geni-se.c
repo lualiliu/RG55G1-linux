@@ -922,15 +922,27 @@ int geni_icc_get(struct geni_se *se, const char *icc_ddr)
 	if (has_acpi_companion(se->dev))
 		return 0;
 
+	/*
+	 * Interconnects are optional when the DT omits them (early bring-up
+	 * without an ICC provider). Treat -ENODATA like the DDR path.
+	 */
 	icc_paths[GENI_TO_CORE].path = devm_of_icc_get(se->dev, "qup-core");
-	if (IS_ERR(icc_paths[GENI_TO_CORE].path))
-		return dev_err_probe(se->dev, PTR_ERR(icc_paths[GENI_TO_CORE].path),
-				     "Failed to get 'qup-core' ICC path\n");
+	if (IS_ERR(icc_paths[GENI_TO_CORE].path)) {
+		if (PTR_ERR(icc_paths[GENI_TO_CORE].path) == -ENODATA)
+			icc_paths[GENI_TO_CORE].path = NULL;
+		else
+			return dev_err_probe(se->dev, PTR_ERR(icc_paths[GENI_TO_CORE].path),
+					     "Failed to get 'qup-core' ICC path\n");
+	}
 
 	icc_paths[CPU_TO_GENI].path = devm_of_icc_get(se->dev, "qup-config");
-	if (IS_ERR(icc_paths[CPU_TO_GENI].path))
-		return dev_err_probe(se->dev, PTR_ERR(icc_paths[CPU_TO_GENI].path),
-				     "Failed to get 'qup-config' ICC path\n");
+	if (IS_ERR(icc_paths[CPU_TO_GENI].path)) {
+		if (PTR_ERR(icc_paths[CPU_TO_GENI].path) == -ENODATA)
+			icc_paths[CPU_TO_GENI].path = NULL;
+		else
+			return dev_err_probe(se->dev, PTR_ERR(icc_paths[CPU_TO_GENI].path),
+					     "Failed to get 'qup-config' ICC path\n");
+	}
 
 	/* The DDR path is optional, depending on protocol and hw capabilities */
 	icc_paths[GENI_TO_DDR].path = devm_of_icc_get(se->dev, "qup-memory");
@@ -1572,12 +1584,10 @@ int geni_load_se_firmware(struct geni_se *se, enum geni_se_protocol_type protoco
 
 	ret = request_firmware(&fw, fw_name, se->dev);
 	if (ret) {
-		if (ret == -ENOENT)
-			return -EPROBE_DEFER;
-
+		/* Do not defer forever when firmware is absent (bring-up rootfs). */
 		dev_err(se->dev, "Failed to request firmware '%s' for protocol %d: ret: %d\n",
 			fw_name, protocol, ret);
-		return ret;
+		return ret == -ENOENT ? -ENODEV : ret;
 	}
 
 	ret = geni_load_se_fw(se, fw, mode, protocol);
@@ -1681,7 +1691,19 @@ static struct platform_driver geni_se_driver = {
 	},
 	.probe = geni_se_probe,
 };
-module_platform_driver(geni_se_driver);
+
+static int __init geni_se_driver_init(void)
+{
+	return platform_driver_register(&geni_se_driver);
+}
+/* RG55G1 skips device_initcall (LV4+); register before custom USB/SPI bring-up. */
+arch_initcall(geni_se_driver_init);
+
+static void __exit geni_se_driver_exit(void)
+{
+	platform_driver_unregister(&geni_se_driver);
+}
+module_exit(geni_se_driver_exit);
 
 MODULE_DESCRIPTION("GENI Serial Engine Driver");
 MODULE_LICENSE("GPL v2");
