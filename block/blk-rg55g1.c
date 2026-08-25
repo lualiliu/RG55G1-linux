@@ -24,6 +24,9 @@ int __init leds_init(void);
 #if IS_ENABLED(CONFIG_MQ_IOSCHED_DEADLINE)
 int __init deadline_init(void);
 #endif
+#if IS_ENABLED(CONFIG_POWER_SUPPLY)
+int __init power_supply_class_init(void);
+#endif
 
 int __init rg55g1_subsys_bringup(void)
 {
@@ -59,6 +62,12 @@ int __init rg55g1_subsys_bringup(void)
 #endif
 #if IS_ENABLED(CONFIG_MQ_IOSCHED_DEADLINE)
 	ret = deadline_init();
+	if (ret)
+		return ret;
+#endif
+#if IS_ENABLED(CONFIG_POWER_SUPPLY)
+	/* Skipped with LV4; needed before rg55g1 power_supply_register(). */
+	ret = power_supply_class_init();
 	if (ret)
 		return ret;
 #endif

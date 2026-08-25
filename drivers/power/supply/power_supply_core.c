@@ -1771,7 +1771,7 @@ void *power_supply_get_drvdata(struct power_supply *psy)
 }
 EXPORT_SYMBOL_GPL(power_supply_get_drvdata);
 
-static int __init power_supply_class_init(void)
+int __init power_supply_class_init(void)
 {
 	power_supply_init_attrs();
 	return class_register(&power_supply_class);

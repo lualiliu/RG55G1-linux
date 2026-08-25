@@ -369,9 +369,11 @@ static const struct fb_ops rg55_splash_ops = {
 static unsigned int rg55_status_slot;
 static char rg55_status_msg[RG55_STATUS_ROWS][24];
 static u32 rg55_status_color[RG55_STATUS_ROWS];
-/* Always painted on row 0 so USB/XHCI spam cannot scroll VBUS away. */
+/* Always painted so USB/XHCI spam cannot scroll them away. */
 static char rg55_vbus_sticky[24] = "VBUS:?";
 static u32 rg55_vbus_color = 0x00808080;
+static char rg55_batt_sticky[24] = "BAT:?";
+static u32 rg55_batt_color = 0x00808080;
 
 static void rg55_hw_bar(void *hw, u32 y, u32 h, u32 color)
 {
@@ -450,17 +452,22 @@ static void rg55_repaint_status(void)
 	if (!hw)
 		return;
 
-	/* Sticky VBUS on row 0 */
+	/* Sticky VBUS on row 0, battery on row 1 */
 	rg55_hw_bar(hw, 0, RG55_LINE_H, rg55_vbus_color);
 	snprintf(buf, sizeof(buf), "0 %s", rg55_vbus_sticky);
 	fg = rg55_status_fg(rg55_vbus_color);
 	rg55_hw_puts2x(hw, 16, 0, buf, fg, rg55_vbus_color);
 
-	for (i = 0; i < rg55_status_slot && i < RG55_STATUS_ROWS - 1; i++) {
-		u32 y = (i + 1) * RG55_LINE_H;
+	rg55_hw_bar(hw, RG55_LINE_H, RG55_LINE_H, rg55_batt_color);
+	snprintf(buf, sizeof(buf), "1 %s", rg55_batt_sticky);
+	fg = rg55_status_fg(rg55_batt_color);
+	rg55_hw_puts2x(hw, 16, RG55_LINE_H, buf, fg, rg55_batt_color);
+
+	for (i = 0; i < rg55_status_slot && i < RG55_STATUS_ROWS - 2; i++) {
+		u32 y = (i + 2) * RG55_LINE_H;
 
 		rg55_hw_bar(hw, y, RG55_LINE_H, rg55_status_color[i]);
-		snprintf(buf, sizeof(buf), "%u %s", i + 1, rg55_status_msg[i]);
+		snprintf(buf, sizeof(buf), "%u %s", i + 2, rg55_status_msg[i]);
 		fg = rg55_status_fg(rg55_status_color[i]);
 		rg55_hw_puts2x(hw, 16, y, buf, fg, rg55_status_color[i]);
 	}
@@ -478,13 +485,13 @@ void rg55g1_status(const char *msg, u32 color)
 	if (!msg)
 		msg = "?";
 
-	/* Scrollable region is rows 1..N-1 (row 0 = VBUS sticky). */
-	if (rg55_status_slot >= RG55_STATUS_ROWS - 1) {
+	/* Scrollable region is rows 2..N-1 (0=VBUS, 1=BAT sticky). */
+	if (rg55_status_slot >= RG55_STATUS_ROWS - 2) {
 		memmove(rg55_status_msg[0], rg55_status_msg[1],
-			(RG55_STATUS_ROWS - 2) * sizeof(rg55_status_msg[0]));
+			(RG55_STATUS_ROWS - 3) * sizeof(rg55_status_msg[0]));
 		memmove(rg55_status_color, rg55_status_color + 1,
-			(RG55_STATUS_ROWS - 2) * sizeof(rg55_status_color[0]));
-		rg55_status_slot = RG55_STATUS_ROWS - 2;
+			(RG55_STATUS_ROWS - 3) * sizeof(rg55_status_color[0]));
+		rg55_status_slot = RG55_STATUS_ROWS - 3;
 	}
 	strscpy(rg55_status_msg[rg55_status_slot], msg,
 		sizeof(rg55_status_msg[0]));
@@ -504,6 +511,17 @@ void rg55g1_status_vbus(const char *msg, u32 color)
 		rg55_repaint_status();
 }
 EXPORT_SYMBOL_GPL(rg55g1_status_vbus);
+
+void rg55g1_status_batt(const char *msg, u32 color)
+{
+	if (!msg)
+		msg = "BAT:?";
+	strscpy(rg55_batt_sticky, msg, sizeof(rg55_batt_sticky));
+	rg55_batt_color = color;
+	if (rg55g1_splash_hw)
+		rg55_repaint_status();
+}
+EXPORT_SYMBOL_GPL(rg55g1_status_batt);
 
 void rg55g1_mark(u32 y, u32 color)
 {
@@ -1208,6 +1226,7 @@ static int __init rg55g1_splash_console_init(void)
 	rg55g1_status("FB-MAP", 0x00404040);
 	rg55g1_status("READY", 0x00ffff00);
 	rg55g1_status_vbus("VBUS:wait", 0x00808080);
+	rg55g1_status_batt("BAT:wait", 0x00808080);
 	rg55g1_pending_fb = info;
 	return 0;
 }

@@ -903,6 +903,9 @@ static inline int power_supply_set_property_direct(struct power_supply *psy,
 #endif
 extern void power_supply_external_power_changed(struct power_supply *psy);
 
+/* RG55G1: also invoked from rg55g1_subsys_bringup when LV4 initcalls are skipped. */
+int __init power_supply_class_init(void);
+
 extern struct power_supply *__must_check
 power_supply_register(struct device *parent,
 				 const struct power_supply_desc *desc,

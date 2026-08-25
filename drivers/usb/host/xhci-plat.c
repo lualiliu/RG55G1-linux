@@ -58,6 +58,7 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 	bool was_conn, ccs, quiet;
 	extern void rg55g1_status(const char *msg, u32 color);
 	extern bool rg55g1_usb_loose_supplies;
+	extern bool rg55g1_usb_host_port_connected;
 
 	if (!rg55g1_usb_loose_supplies || !xhci)
 		return;
@@ -69,6 +70,7 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 	if (hcd && xhci->usb2_rhub.ports && xhci->usb2_rhub.num_ports)
 		u2 = xhci_portsc_readl(xhci->usb2_rhub.ports[0]);
 	ccs = !!(u2 & PORT_CONNECT);
+	rg55g1_usb_host_port_connected = ccs;
 
 	if (ccs)
 		p->ever_connected = true;

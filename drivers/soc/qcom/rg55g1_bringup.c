@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * RG55G1 bring-up: reach ash on splash FB, then enable a minimal USB host
- * path so a USB keyboard can feed tty0, plus SDHCI for /dev/mmcblk*.
+ * path so a USB keyboard can feed tty0, plus SDHCI for /dev/mmcblk*, and
+ * PM7250B Type-C dual-role (OTG VBUS for peripherals / USBIN battery charge).
  */
 
 #include <linux/bits.h>
@@ -12,10 +13,12 @@
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/math64.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/power_supply.h>
 #include <linux/printk.h>
 #include <linux/property.h>
 #include <linux/slab.h>
@@ -34,9 +37,14 @@ EXPORT_SYMBOL_GPL(rg55g1_skip_of_populate);
 bool rg55g1_usb_loose_supplies = true;
 EXPORT_SYMBOL_GPL(rg55g1_usb_loose_supplies);
 
+/* Set by xhci-plat poll from PORT_CONNECT (keyboard may work while CC=A0/C0). */
+bool rg55g1_usb_host_port_connected;
+EXPORT_SYMBOL_GPL(rg55g1_usb_host_port_connected);
+
 extern bool rg55g1_block_deferred;
 extern void rg55g1_status(const char *msg, u32 color);
 extern void rg55g1_status_vbus(const char *msg, u32 color);
+extern void rg55g1_status_batt(const char *msg, u32 color);
 extern void driver_deferred_probe_trigger(void);
 
 static void rg55g1_force_status(struct device_node *np, const char *status)
@@ -370,11 +378,38 @@ int rg55g1_sanitize_dt(void)
 }
 EXPORT_SYMBOL_GPL(rg55g1_sanitize_dt);
 
-/* PM7250B SMB5 — DCDC @ 0x1100 / TYPEC @ 0x1500 (smb5-reg.h). */
+/*
+ * PM7250B SMB5 (smb5-reg.h):
+ *   CHGR @ 0x1000 / DCDC @ 0x1100 / USBIN @ 0x1300 / TYPEC @ 0x1500
+ * Current step for FCC/ICL is 50 mA.
+ */
+#define RG55_CHGR_BASE			0x1000
+#define RG55_CHGR_STATUS_1		(RG55_CHGR_BASE + 0x06)
+#define RG55_CHGR_STATUS_MASK		GENMASK(2, 0)
+#define RG55_CHGR_INHIBIT		0
+#define RG55_CHGR_TRICKLE		1
+#define RG55_CHGR_PRE			2
+#define RG55_CHGR_FULLON		3
+#define RG55_CHGR_TAPER			4
+#define RG55_CHGR_TERMINATE		5
+#define RG55_CHGR_PAUSE			6
+#define RG55_CHGR_DISABLE		7
+#define RG55_CHGR_ENABLE		(RG55_CHGR_BASE + 0x42)
+#define RG55_CHGR_ENABLE_BIT		BIT(0)
+#define RG55_CHGR_PAUSE_CMD		(RG55_CHGR_BASE + 0x43)
+#define RG55_CHGR_CFG2			(RG55_CHGR_BASE + 0x51)
+#define RG55_CHGR_CHG_EN_SRC		BIT(7)	/* 0 = SW charging enable */
+#define RG55_CHGR_FCC_CFG		(RG55_CHGR_BASE + 0x61)
+#define RG55_CHGR_CUR_STEP_UA		50000
+#define RG55_CHGR_FCC_1A		(1000000 / RG55_CHGR_CUR_STEP_UA)
+
 #define RG55_DCDC_BASE			0x1100
 #define RG55_DCDC_TYPE			(RG55_DCDC_BASE + 0x04)
 #define RG55_DCDC_SUBTYPE		(RG55_DCDC_BASE + 0x05)
 #define RG55_POWER_PATH_STATUS		(RG55_DCDC_BASE + 0x0B)
+#define RG55_PP_USBIN_SUSPEND_STS	BIT(6)
+#define RG55_PP_USE_USBIN		BIT(4)
+#define RG55_PP_VALID_INPUT		BIT(0)
 #define RG55_CMD_OTG			(RG55_DCDC_BASE + 0x40)
 #define RG55_OTG_ILIMIT			(RG55_DCDC_BASE + 0x52)
 #define RG55_OTG_CFG			(RG55_DCDC_BASE + 0x53)
@@ -385,8 +420,29 @@ EXPORT_SYMBOL_GPL(rg55g1_sanitize_dt);
 #define RG55_OTG_ENG_CFG		(RG55_DCDC_BASE + 0xC0)
 /* Android sets this before enabling OTG (halt 1-in-8 mode). */
 #define RG55_OTG_ENG_HALT		BIT(0)
-#define RG55_USB_CMD_IL			0x1340	/* USBIN_CMD_IL */
+
+#define RG55_USBIN_BASE			0x1300
+#define RG55_USBIN_INT_RT_STS		(RG55_USBIN_BASE + 0x10)
+#define RG55_USBIN_PLUGIN_RT		BIT(4)
+#define RG55_APSD_STATUS		(RG55_USBIN_BASE + 0x07)
+#define RG55_APSD_DONE			BIT(0)
+#define RG55_APSD_RESULT		(RG55_USBIN_BASE + 0x08)
+#define RG55_APSD_DCP			BIT(3)
+#define RG55_APSD_CDP			BIT(2)
+#define RG55_APSD_SDP			BIT(0)
+#define RG55_USB_CMD_IL			(RG55_USBIN_BASE + 0x40) /* USBIN_CMD_IL */
 #define RG55_USB_SUSPEND		BIT(0)
+#define RG55_USBIN_ICL_OVERRIDE		(RG55_USBIN_BASE + 0x42)
+#define RG55_ICL_OVERRIDE_BIT		BIT(0)
+#define RG55_CMD_APSD			(RG55_USBIN_BASE + 0x41)
+#define RG55_APSD_RERUN			BIT(0)
+#define RG55_USBIN_ICL_OPTIONS		(RG55_USBIN_BASE + 0x66)
+#define RG55_USB51_MODE			BIT(1)
+#define RG55_USBIN_MODE_CHG		BIT(0)
+#define RG55_USBIN_ICL_CFG		(RG55_USBIN_BASE + 0x70)
+#define RG55_ICL_500MA			(500000 / RG55_CHGR_CUR_STEP_UA)
+#define RG55_ICL_1500MA			(1500000 / RG55_CHGR_CUR_STEP_UA)
+#define RG55_ICL_3000MA			(3000000 / RG55_CHGR_CUR_STEP_UA)
 
 /* Aliases kept for older scan logs that looked for "OTG@0x1100". */
 #define RG55_OTG_BASE			RG55_DCDC_BASE
@@ -395,6 +451,7 @@ EXPORT_SYMBOL_GPL(rg55g1_sanitize_dt);
 
 #define RG55_TYPEC_BASE			0x1500
 #define RG55_TYPEC_TYPE			(RG55_TYPEC_BASE + 0x04)
+#define RG55_TYPEC_SNK_STATUS		(RG55_TYPEC_BASE + 0x06)
 #define RG55_TYPEC_SRC_STATUS		(RG55_TYPEC_BASE + 0x08)
 #define RG55_TYPEC_SM_STATUS		(RG55_TYPEC_BASE + 0x09)
 #define RG55_TYPEC_MISC_STATUS		(RG55_TYPEC_BASE + 0x0B)
@@ -411,12 +468,54 @@ EXPORT_SYMBOL_GPL(rg55g1_sanitize_dt);
 #define RG55_TYPEC_DISABLE_CMD		BIT(0)
 #define RG55_TYPEC_EN_SNK_ONLY		BIT(1)
 #define RG55_TYPEC_EN_SRC_ONLY		BIT(2)
+#define RG55_TYPEC_EN_TRY_SNK		BIT(4)
 #define RG55_TYPEC_RP_1P5		0x1	/* TYPEC_SRC_RP_1P5A */
 #define RG55_TYPEC_SEL_SRC_UPPER_REF	BIT(2)
 #define RG55_TYPEC_VCONN_EN_SRC		BIT(0)
 #define RG55_TYPEC_DBG_SRC_EN		BIT(0)
 #define RG55_TYPEC_VBUS_DETECT		RG55_TYPEC_SNK_SRC_MODE
 #define RG55_TYPEC_SRC_RD_OPEN		BIT(3)
+#define RG55_SNK_RP_STD			BIT(3)
+#define RG55_SNK_RP_1P5			BIT(2)
+#define RG55_SNK_RP_3P0			BIT(1)
+
+/* PM7250B Qualcomm Gauge @ 0x4800 (qg-reg.h / qg-defs.h). */
+#define RG55_QG_BASE			0x4800
+#define RG55_QG_TYPE			(RG55_QG_BASE + 0x04)
+#define RG55_QG_SUBTYPE			(RG55_QG_BASE + 0x05)
+#define RG55_QG_STATUS1			(RG55_QG_BASE + 0x08)
+#define RG55_QG_OK			BIT(7)
+#define RG55_QG_BATT_PRESENT		BIT(0)
+#define RG55_QG_TYPE_VAL		0x0D
+#define RG55_QG_SOC_MONOTONIC		(RG55_QG_BASE + 0xBF)
+#define RG55_QG_LAST_ADC_V		(RG55_QG_BASE + 0xC0)
+#define RG55_QG_LAST_ADC_I		(RG55_QG_BASE + 0xC2)
+#define RG55_QG_S2_AVG_V		(RG55_QG_BASE + 0x80)
+#define RG55_QG_V_RAW_TO_UV(raw)	div_u64(194637ULL * (u64)(raw), 1000)
+#define RG55_QG_FIFO_RESET_RAW		0x8000
+/* Voltage→SOC when ADSP gauge is idle (monotonic SOC is often stale 100%). */
+#define RG55_VBATT_EMPTY_UV		3400000
+#define RG55_VBATT_FULL_UV		4200000
+#define RG55_VBATT_MIN_VALID_UV		2500000
+#define RG55_VBATT_MAX_VALID_UV		4600000
+
+enum rg55_vbus_role {
+	RG55_VBUS_ROLE_NONE = 0,
+	RG55_VBUS_ROLE_OTG,
+	RG55_VBUS_ROLE_CHG,
+	RG55_VBUS_ROLE_READY,
+};
+
+struct rg55_batt_state {
+	int capacity;		/* 0..100 */
+	int voltage_uv;
+	int current_ua;
+	int status;		/* POWER_SUPPLY_STATUS_* */
+	int health;
+	bool present;
+	bool usb_online;
+	bool valid;
+};
 
 struct rg55_spmi_match {
 	struct spmi_controller *ctrl;
@@ -539,15 +638,76 @@ static int rg55g1_sid_write(struct spmi_controller *ctrl, u8 sid, u16 addr,
 	return ret;
 }
 
-/* Keep TYPEC in SRC + OTG asserted — DISABLE leaves receptacle at 0V. */
+static int rg55g1_sid_readn(struct spmi_controller *ctrl, u8 sid, u16 addr,
+			    u8 *buf, size_t len)
+{
+	struct spmi_device *sdev;
+	int ret;
+
+	if (!buf || !len || len > 16)
+		return -EINVAL;
+	sdev = spmi_device_alloc(ctrl);
+	if (!sdev)
+		return -ENOMEM;
+	sdev->usid = sid;
+	ret = spmi_ext_register_readl(sdev, addr, buf, len);
+	put_device(&sdev->dev);
+	return ret;
+}
+
+/*
+ * Type-C keepalive — same port: sticky OTG (keyboard) XOR sink charge.
+ *
+ * Do NOT idle in try.SNK: flipping TRY_SNK↔SRC drops VBUS and yields the
+ * k01/S1/A0/C0 ↔ RDY/trySNK oscillation (keyboard never reaches A1/C1).
+ * Default is SRC+OTG (original working host path). Runtime charger probe runs
+ * only when xHCI reports no device (keyboard stays up even if PMIC CC=A0/C0).
+ */
 static struct spmi_controller *vbus_keep_ctrl;
 static u8 vbus_keep_sid;
+static enum rg55_vbus_role vbus_keep_role = RG55_VBUS_ROLE_NONE;
+static unsigned long vbus_chg_probe_at;
+static unsigned int vbus_chg_idle_ticks;
 static void rg55g1_vbus_keep_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(vbus_keep_work, rg55g1_vbus_keep_fn);
+static void rg55g1_batt_update_and_show(struct spmi_controller *ctrl, u8 sid);
+static int rg55g1_psy_register(void);
+static bool rg55g1_vbus_partner_is_charger(u8 snk, u8 pp, u8 cmd, u8 plugin,
+					  u8 apsd, bool is_src);
+static bool rg55g1_vbus_probe_charger(struct spmi_controller *ctrl, u8 sid);
+
+#define RG55_CHG_IDLE_TICKS		6	/* ~3s without xHCI device */
+#define RG55_CHG_PROBE_PERIOD_MS	8000
+#define RG55_CHG_FIRST_PROBE_MS		5000	/* after boot, before 1st probe */
+#define RG55_BOOT_CHG_PROBE_MS		400
+#define RG55_CHG_PROBE_WINDOW_MS	400
+
+static void rg55g1_vbus_unsuspend_usbin(struct spmi_controller *ctrl, u8 sid)
+{
+	u8 il = 0;
+
+	if (!rg55g1_sid_read(ctrl, sid, RG55_USB_CMD_IL, &il))
+		(void)rg55g1_sid_write(ctrl, sid, RG55_USB_CMD_IL,
+				       il & ~RG55_USB_SUSPEND);
+}
+
+/* Android PMIC Type-C init: VCONN + CC debounce before SRC/OTG. */
+static void rg55g1_vbus_typec_host_prep(struct spmi_controller *ctrl, u8 sid)
+{
+	u8 exit = 0;
+
+	(void)rg55g1_sid_write(ctrl, sid, RG55_TYPEC_VCONN_CTL,
+			       RG55_TYPEC_VCONN_EN_SRC);
+	if (!rg55g1_sid_read(ctrl, sid, RG55_TYPEC_EXIT_STATE, &exit))
+		(void)rg55g1_sid_write(ctrl, sid, RG55_TYPEC_EXIT_STATE,
+				       exit | RG55_TYPEC_SEL_SRC_UPPER_REF | BIT(1));
+}
 
 static void rg55g1_vbus_force_otg(struct spmi_controller *ctrl, u8 sid)
 {
 	u8 eng = 0, il = 0, cfg = 0;
+
+	rg55g1_vbus_typec_host_prep(ctrl, sid);
 
 	/* SRC-only + Rp (no debug-accessory wrestling). */
 	(void)rg55g1_sid_write(ctrl, sid, RG55_TYPEC_DEBUG_SRC, 0);
@@ -574,18 +734,185 @@ static void rg55g1_vbus_force_otg(struct spmi_controller *ctrl, u8 sid)
 				       eng | RG55_OTG_ENG_HALT);
 
 	(void)rg55g1_sid_write(ctrl, sid, RG55_CMD_OTG, RG55_OTG_EN);
+	vbus_keep_role = RG55_VBUS_ROLE_OTG;
+}
+
+/* Sink path: stop OTG, accept USBIN, enable CHGR (FCC 1A, ICL from Rp/APSD). */
+static void rg55g1_vbus_force_charge(struct spmi_controller *ctrl, u8 sid)
+{
+	u8 snk = 0, apsd = 0, opts = 0, cfg2 = 0, icl = RG55_ICL_500MA;
+
+	(void)rg55g1_sid_write(ctrl, sid, RG55_CMD_OTG, 0);
+	(void)rg55g1_sid_write(ctrl, sid, RG55_TYPEC_DEBUG_SRC, 0);
+	(void)rg55g1_sid_write(ctrl, sid, RG55_TYPEC_MODE_CFG,
+			       RG55_TYPEC_EN_SNK_ONLY);
+
+	rg55g1_vbus_unsuspend_usbin(ctrl, sid);
+
+	/* SW controls charging enable (clear CHG_EN_SRC). */
+	if (!rg55g1_sid_read(ctrl, sid, RG55_CHGR_CFG2, &cfg2)) {
+		cfg2 &= ~RG55_CHGR_CHG_EN_SRC;
+		(void)rg55g1_sid_write(ctrl, sid, RG55_CHGR_CFG2, cfg2);
+	}
+
+	(void)rg55g1_sid_write(ctrl, sid, RG55_CMD_APSD, RG55_APSD_RERUN);
+
+	(void)rg55g1_sid_read(ctrl, sid, RG55_TYPEC_SNK_STATUS, &snk);
+	(void)rg55g1_sid_read(ctrl, sid, RG55_APSD_RESULT, &apsd);
+
+	if (snk & RG55_SNK_RP_3P0)
+		icl = RG55_ICL_3000MA;
+	else if (snk & RG55_SNK_RP_1P5)
+		icl = RG55_ICL_1500MA;
+	else if (snk & RG55_SNK_RP_STD)
+		icl = RG55_ICL_500MA;
+	else if (apsd & (RG55_APSD_DCP | RG55_APSD_CDP))
+		icl = RG55_ICL_1500MA;
+	else
+		icl = RG55_ICL_1500MA; /* wall wart / unknown: try 1.5A */
+
+	(void)rg55g1_sid_write(ctrl, sid, RG55_USBIN_ICL_CFG, icl);
+	(void)rg55g1_sid_write(ctrl, sid, RG55_USBIN_ICL_OVERRIDE,
+			       RG55_ICL_OVERRIDE_BIT);
+
+	if (!rg55g1_sid_read(ctrl, sid, RG55_USBIN_ICL_OPTIONS, &opts)) {
+		opts = (opts & ~RG55_USB51_MODE) | RG55_USBIN_MODE_CHG;
+		(void)rg55g1_sid_write(ctrl, sid, RG55_USBIN_ICL_OPTIONS, opts);
+	}
+
+	(void)rg55g1_sid_write(ctrl, sid, RG55_CHGR_FCC_CFG, RG55_CHGR_FCC_1A);
+	(void)rg55g1_sid_write(ctrl, sid, RG55_CHGR_PAUSE_CMD, 0);
+	(void)rg55g1_sid_write(ctrl, sid, RG55_CHGR_ENABLE,
+			       RG55_CHGR_ENABLE_BIT);
+	vbus_keep_role = RG55_VBUS_ROLE_CHG;
+}
+
+static bool rg55g1_vbus_partner_is_charger(u8 snk, u8 pp, u8 cmd, u8 plugin,
+					  u8 apsd, bool is_src)
+{
+	/* Partner advertises Rp → wall/PC source (we sink). */
+	if (snk & (RG55_SNK_RP_STD | RG55_SNK_RP_1P5 | RG55_SNK_RP_3P0))
+		return true;
+
+	/* DCP/CDP only — bare SDP false-triggers against OTG. */
+	if (apsd & (RG55_APSD_DCP | RG55_APSD_CDP))
+		return true;
+
+	if (cmd & RG55_OTG_EN)
+		return false;
+	if (plugin & RG55_USBIN_PLUGIN_RT)
+		return true;
+	if ((pp & RG55_PP_VALID_INPUT) && (pp & RG55_PP_USE_USBIN) &&
+	    !(pp & RG55_PP_USBIN_SUSPEND_STS))
+		return true;
+	(void)is_src;
+	return false;
+}
+
+/*
+ * Brief sink window to detect a wall charger. Only call when xHCI has no
+ * peripheral — flipping to SNK drops VBUS and disconnects a keyboard.
+ */
+static bool rg55g1_vbus_probe_charger_ms(struct spmi_controller *ctrl, u8 sid,
+					  unsigned int ms)
+{
+	u8 snk = 0, pp = 0, cmd = 0, plugin = 0, apsd = 0;
+
+	if (rg55g1_usb_host_port_connected)
+		return false;
+
+	(void)rg55g1_sid_write(ctrl, sid, RG55_CMD_OTG, 0);
+	(void)rg55g1_sid_write(ctrl, sid, RG55_TYPEC_MODE_CFG,
+			       RG55_TYPEC_EN_SNK_ONLY);
+	rg55g1_vbus_unsuspend_usbin(ctrl, sid);
+	(void)rg55g1_sid_write(ctrl, sid, RG55_CMD_APSD, RG55_APSD_RERUN);
+	msleep(ms);
+
+	(void)rg55g1_sid_read(ctrl, sid, RG55_TYPEC_SNK_STATUS, &snk);
+	(void)rg55g1_sid_read(ctrl, sid, RG55_POWER_PATH_STATUS, &pp);
+	(void)rg55g1_sid_read(ctrl, sid, RG55_CMD_OTG, &cmd);
+	(void)rg55g1_sid_read(ctrl, sid, RG55_USBIN_INT_RT_STS, &plugin);
+	(void)rg55g1_sid_read(ctrl, sid, RG55_APSD_RESULT, &apsd);
+
+	return rg55g1_vbus_partner_is_charger(snk, pp, cmd, plugin, apsd, false);
+}
+
+static bool rg55g1_vbus_probe_charger(struct spmi_controller *ctrl, u8 sid)
+{
+	return rg55g1_vbus_probe_charger_ms(ctrl, sid, RG55_CHG_PROBE_WINDOW_MS);
 }
 
 static void rg55g1_vbus_keep_fn(struct work_struct *work)
 {
-	u8 cmd = 0, misc = 0, sm = 0, pp = 0, src = 0;
+	u8 cmd = 0, misc = 0, sm = 0, pp = 0, src = 0, snk = 0;
+	u8 chg = 0, icl = 0, en = 0, plugin = 0, apsd = 0;
 	char msg[28];
 	u32 color;
+	bool want_chg;
 
 	if (!vbus_keep_ctrl)
 		return;
 
-	rg55g1_vbus_force_otg(vbus_keep_ctrl, vbus_keep_sid);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_TYPEC_MISC_STATUS, &misc);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_TYPEC_SM_STATUS, &sm);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_POWER_PATH_STATUS, &pp);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_TYPEC_SRC_STATUS, &src);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_TYPEC_SNK_STATUS, &snk);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid, RG55_CMD_OTG, &cmd);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_USBIN_INT_RT_STS, &plugin);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_APSD_RESULT, &apsd);
+
+	if (vbus_keep_role == RG55_VBUS_ROLE_CHG) {
+		want_chg = rg55g1_vbus_partner_is_charger(snk, pp, cmd, plugin,
+							  apsd, false);
+	} else if (rg55g1_usb_host_port_connected) {
+		/* Keyboard/peripheral on xHCI — stay host, never PROBE-CHG. */
+		want_chg = false;
+		vbus_chg_idle_ticks = 0;
+		vbus_chg_probe_at = jiffies +
+			msecs_to_jiffies(RG55_CHG_PROBE_PERIOD_MS);
+	} else {
+		want_chg = !!(snk & (RG55_SNK_RP_STD | RG55_SNK_RP_1P5 |
+				     RG55_SNK_RP_3P0));
+
+		if (!want_chg) {
+			vbus_chg_idle_ticks++;
+			if (vbus_chg_idle_ticks >= RG55_CHG_IDLE_TICKS &&
+			    time_after(jiffies, vbus_chg_probe_at)) {
+				rg55g1_status_vbus("PROBE-CHG", 0x00ffff00);
+				if (rg55g1_vbus_probe_charger(vbus_keep_ctrl,
+							      vbus_keep_sid))
+					want_chg = true;
+				vbus_chg_probe_at = jiffies +
+					msecs_to_jiffies(RG55_CHG_PROBE_PERIOD_MS);
+				vbus_chg_idle_ticks = 0;
+			}
+		} else {
+			vbus_chg_idle_ticks = 0;
+		}
+	}
+
+	if (want_chg) {
+		if (vbus_keep_role != RG55_VBUS_ROLE_CHG)
+			rg55g1_vbus_force_charge(vbus_keep_ctrl, vbus_keep_sid);
+		else {
+			rg55g1_vbus_unsuspend_usbin(vbus_keep_ctrl,
+						   vbus_keep_sid);
+			(void)rg55g1_sid_write(vbus_keep_ctrl, vbus_keep_sid,
+					       RG55_CHGR_ENABLE,
+					       RG55_CHGR_ENABLE_BIT);
+		}
+	} else {
+		/* Re-apply full SRC+OTG every tick (original stable keyboard path). */
+		rg55g1_vbus_force_otg(vbus_keep_ctrl, vbus_keep_sid);
+	}
 
 	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid, RG55_CMD_OTG, &cmd);
 	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
@@ -595,38 +922,397 @@ static void rg55g1_vbus_keep_fn(struct work_struct *work)
 	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
 			      RG55_POWER_PATH_STATUS, &pp);
 	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
-			      RG55_TYPEC_SRC_STATUS, &src);
+			      RG55_CHGR_STATUS_1, &chg);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_USBIN_ICL_CFG, &icl);
+	(void)rg55g1_sid_read(vbus_keep_ctrl, vbus_keep_sid,
+			      RG55_CHGR_ENABLE, &en);
 
-	/*
-	 * k=CMD_OTG  S=source-mode(misc.6)  A=attach(sm.5)  C=CC
-	 * Want: k01/S1/A1/C1  (+ meter ~5V)
-	 */
-	snprintf(msg, sizeof(msg), "k%02X/S%d/A%d/C%d",
-		 cmd,
-		 !!(misc & RG55_TYPEC_SNK_SRC_MODE),
-		 !!(sm & RG55_TYPEC_ATTACH_STATE),
-		 !!(misc & RG55_TYPEC_CC_ATTACHED));
-	if ((cmd & RG55_OTG_EN) && (misc & RG55_TYPEC_SNK_SRC_MODE))
-		color = 0x0000ff00;
-	else if (misc & RG55_TYPEC_CC_ATTACHED)
-		color = 0x00ffff00;
-	else
-		color = 0x00ff8000;
+	if (vbus_keep_role == RG55_VBUS_ROLE_CHG) {
+		/* CHG/c<stat>/i<icl>/p — charging when en + valid path */
+		snprintf(msg, sizeof(msg), "CHG/c%X/i%02X/p%d",
+			 (unsigned int)(chg & RG55_CHGR_STATUS_MASK), icl,
+			 !!(pp & RG55_PP_VALID_INPUT));
+		if ((en & RG55_CHGR_ENABLE_BIT) && (pp & RG55_PP_VALID_INPUT) &&
+		    !(pp & RG55_PP_USBIN_SUSPEND_STS))
+			color = 0x0000ff00;
+		else if (misc & RG55_TYPEC_CC_ATTACHED)
+			color = 0x00ffff00;
+		else
+			color = 0x00ff8000;
+	} else if (vbus_keep_role == RG55_VBUS_ROLE_OTG) {
+		/* k=CMD_OTG  S=source  A=attach  C=CC — want k01/S1/A1/C1 */
+		snprintf(msg, sizeof(msg), "k%02X/S%d/A%d/C%d",
+			 cmd,
+			 !!(misc & RG55_TYPEC_SNK_SRC_MODE),
+			 !!(sm & RG55_TYPEC_ATTACH_STATE),
+			 !!(misc & RG55_TYPEC_CC_ATTACHED));
+		if ((cmd & RG55_OTG_EN) && (misc & RG55_TYPEC_SNK_SRC_MODE) &&
+		    (misc & RG55_TYPEC_CC_ATTACHED))
+			color = 0x0000ff00;
+		else if ((cmd & RG55_OTG_EN) && (misc & RG55_TYPEC_SNK_SRC_MODE))
+			color = 0x00ffff00; /* VBUS up, waiting for CC */
+		else
+			color = 0x00ff8000;
+	} else {
+		snprintf(msg, sizeof(msg), "OTG-idle");
+		color = 0x00808080;
+	}
 	rg55g1_status_vbus(msg, color);
 
-	/* Quiet: no kernel log. pp/src kept for future if needed. */
-	(void)pp;
-	(void)src;
+	rg55g1_batt_update_and_show(vbus_keep_ctrl, vbus_keep_sid);
 
 	schedule_delayed_work(&vbus_keep_work, msecs_to_jiffies(500));
 }
 
+/*
+ * Minimal /sys/class/power_supply/{battery,usb} via PM7250B QG + CHGR.
+ * Full qcom_battmgr needs ADSP charger_pd; this is SPMI bring-up only.
+ */
+static struct rg55_batt_state rg55_batt;
+static struct power_supply *rg55_batt_psy;
+static struct power_supply *rg55_usb_psy;
+static bool rg55_qg_ok;
+static u8 rg55_qg_sid;
+
+static int rg55_uv_to_capacity(int uv)
+{
+	if (uv <= RG55_VBATT_EMPTY_UV)
+		return 0;
+	if (uv >= RG55_VBATT_FULL_UV)
+		return 100;
+	return (uv - RG55_VBATT_EMPTY_UV) * 100 /
+	       (RG55_VBATT_FULL_UV - RG55_VBATT_EMPTY_UV);
+}
+
+static int rg55_qg_raw_to_uv(u16 raw)
+{
+	int uv;
+
+	if (raw == 0 || raw == 0xffff || raw == RG55_QG_FIFO_RESET_RAW)
+		return 0;
+	uv = RG55_QG_V_RAW_TO_UV(raw);
+	if (uv < RG55_VBATT_MIN_VALID_UV || uv > RG55_VBATT_MAX_VALID_UV)
+		return 0;
+	return uv;
+}
+
+static int rg55_read_vbatt_uv(struct spmi_controller *ctrl, u8 qsid)
+{
+	u8 vraw[2] = { 0, 0 };
+	int uv = 0;
+
+	if (!rg55g1_sid_readn(ctrl, qsid, RG55_QG_S2_AVG_V, vraw, 2)) {
+		uv = rg55_qg_raw_to_uv(vraw[0] | ((u16)vraw[1] << 8));
+		if (uv)
+			return uv;
+	}
+	if (!rg55g1_sid_readn(ctrl, qsid, RG55_QG_LAST_ADC_V, vraw, 2))
+		uv = rg55_qg_raw_to_uv(vraw[0] | ((u16)vraw[1] << 8));
+	return uv;
+}
+
+static int rg55_chg_status_to_psy(u8 chg_stat, bool usb_online, bool otg)
+{
+	u8 st = chg_stat & RG55_CHGR_STATUS_MASK;
+
+	if (otg)
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+	if (!usb_online)
+		return POWER_SUPPLY_STATUS_DISCHARGING;
+
+	switch (st) {
+	case RG55_CHGR_TRICKLE:
+	case RG55_CHGR_PRE:
+	case RG55_CHGR_FULLON:
+	case RG55_CHGR_TAPER:
+		return POWER_SUPPLY_STATUS_CHARGING;
+	case RG55_CHGR_TERMINATE:
+		return POWER_SUPPLY_STATUS_FULL;
+	case RG55_CHGR_INHIBIT:
+	case RG55_CHGR_PAUSE:
+	case RG55_CHGR_DISABLE:
+		return POWER_SUPPLY_STATUS_NOT_CHARGING;
+	default:
+		return POWER_SUPPLY_STATUS_CHARGING;
+	}
+}
+
+static void rg55g1_qg_probe(struct spmi_controller *ctrl, u8 chg_sid)
+{
+	u8 type = 0, st = 0;
+	u8 sid;
+
+	rg55_qg_ok = false;
+
+	if (!rg55g1_sid_read(ctrl, chg_sid, RG55_QG_TYPE, &type) &&
+	    type == RG55_QG_TYPE_VAL) {
+		(void)rg55g1_sid_read(ctrl, chg_sid, RG55_QG_STATUS1, &st);
+		rg55_qg_sid = chg_sid;
+		rg55_qg_ok = true;
+		pr_emerg("rg55g1: QG@0x4800 sid=%u status1=0x%02x\n",
+			 chg_sid, st);
+		return;
+	}
+
+	for (sid = 0; sid < 16; sid++) {
+		if (sid == chg_sid)
+			continue;
+		if (!rg55g1_sid_read(ctrl, sid, RG55_QG_TYPE, &type) &&
+		    type == RG55_QG_TYPE_VAL) {
+			rg55_qg_sid = sid;
+			rg55_qg_ok = true;
+			pr_emerg("rg55g1: QG@0x4800 sid=%u (alt)\n", sid);
+			return;
+		}
+	}
+	pr_emerg("rg55g1: QG not found — voltage/SOC estimate only\n");
+}
+
+static void rg55g1_batt_sample(struct spmi_controller *ctrl, u8 chg_sid)
+{
+	u8 soc_raw = 0, chg = 0, pp = 0, en = 0, cmd = 0, st = 0;
+	u8 plugin = 0;
+	u8 qsid = rg55_qg_ok ? rg55_qg_sid : chg_sid;
+	int uv = 0, pct = -1;
+	bool usb_online, otg;
+	u8 chg_st;
+
+	(void)rg55g1_sid_read(ctrl, chg_sid, RG55_CHGR_STATUS_1, &chg);
+	(void)rg55g1_sid_read(ctrl, chg_sid, RG55_POWER_PATH_STATUS, &pp);
+	(void)rg55g1_sid_read(ctrl, chg_sid, RG55_CHGR_ENABLE, &en);
+	(void)rg55g1_sid_read(ctrl, chg_sid, RG55_CMD_OTG, &cmd);
+	(void)rg55g1_sid_read(ctrl, chg_sid, RG55_USBIN_INT_RT_STS, &plugin);
+
+	otg = !!(cmd & RG55_OTG_EN) && vbus_keep_role == RG55_VBUS_ROLE_OTG;
+	/*
+	 * online = external USBIN in use, or we actively entered charge role.
+	 * Do not force offline merely because role was OTG earlier.
+	 */
+	usb_online = (vbus_keep_role == RG55_VBUS_ROLE_CHG) ||
+		     ((plugin & RG55_USBIN_PLUGIN_RT) && !otg) ||
+		     ((pp & RG55_PP_VALID_INPUT) && (pp & RG55_PP_USE_USBIN) &&
+		      !(pp & RG55_PP_USBIN_SUSPEND_STS) && !otg);
+
+	uv = rg55_read_vbatt_uv(ctrl, qsid);
+
+	if (rg55_qg_ok) {
+		(void)rg55g1_sid_read(ctrl, qsid, RG55_QG_STATUS1, &st);
+		(void)rg55g1_sid_read(ctrl, qsid, RG55_QG_SOC_MONOTONIC,
+				      &soc_raw);
+		rg55_batt.present = !!(st & RG55_QG_BATT_PRESENT) ||
+				    !!(st & RG55_QG_OK) || uv > 2500000;
+
+		/*
+		 * Monotonic SOC needs ADSP qpnp-qg; without it the register
+		 * often sits at 0xff/0xfe → fake 100%. Only trust mid-range
+		 * values when QG_OK is set.
+		 */
+		if ((st & RG55_QG_OK) && soc_raw > 2 && soc_raw < 0xfd)
+			pct = DIV_ROUND_CLOSEST((int)soc_raw * 100, 255);
+	} else {
+		rg55_batt.present = uv > 2500000;
+	}
+
+	if (pct < 0 && uv > 0)
+		pct = rg55_uv_to_capacity(uv);
+	if (pct < 0)
+		pct = 0;
+	if (pct > 100)
+		pct = 100;
+
+	chg_st = chg & RG55_CHGR_STATUS_MASK;
+	rg55_batt.capacity = pct;
+	rg55_batt.voltage_uv = uv;
+	rg55_batt.current_ua = 0;
+	rg55_batt.usb_online = usb_online;
+	rg55_batt.status = rg55_chg_status_to_psy(chg, usb_online, otg);
+	/* Only clamp to 100 on real charge-terminate, not inhibit=0. */
+	if (usb_online && chg_st == RG55_CHGR_TERMINATE)
+		rg55_batt.capacity = 100;
+	rg55_batt.health = rg55_batt.present ? POWER_SUPPLY_HEALTH_GOOD :
+					       POWER_SUPPLY_HEALTH_DEAD;
+	rg55_batt.valid = true;
+}
+
+static void rg55g1_batt_update_and_show(struct spmi_controller *ctrl, u8 sid)
+{
+	char msg[24];
+	u32 color;
+	int mv;
+
+	if (!ctrl)
+		return;
+
+	rg55g1_batt_sample(ctrl, sid);
+
+	mv = rg55_batt.voltage_uv / 1000;
+	if (rg55_batt.status == POWER_SUPPLY_STATUS_CHARGING)
+		snprintf(msg, sizeof(msg), "BAT:%d%% %d.%02dV+",
+			 rg55_batt.capacity, mv / 1000, (mv % 1000) / 10);
+	else if (rg55_batt.status == POWER_SUPPLY_STATUS_FULL)
+		snprintf(msg, sizeof(msg), "BAT:FULL %d.%02dV",
+			 mv / 1000, (mv % 1000) / 10);
+	else
+		snprintf(msg, sizeof(msg), "BAT:%d%% %d.%02dV",
+			 rg55_batt.capacity, mv / 1000, (mv % 1000) / 10);
+
+	if (rg55_batt.capacity <= 15 &&
+	    rg55_batt.status != POWER_SUPPLY_STATUS_CHARGING)
+		color = 0x00ff0000;
+	else if (rg55_batt.status == POWER_SUPPLY_STATUS_CHARGING)
+		color = 0x00ffff00;
+	else if (rg55_batt.status == POWER_SUPPLY_STATUS_FULL)
+		color = 0x0000ff00;
+	else
+		color = 0x0000c0ff;
+
+	rg55g1_status_batt(msg, color);
+
+	/* Only notify after class+psy exist (LV4 skip otherwise WARNs). */
+	if (rg55_batt_psy)
+		power_supply_changed(rg55_batt_psy);
+	if (rg55_usb_psy)
+		power_supply_changed(rg55_usb_psy);
+}
+
+static int rg55_batt_get_prop(struct power_supply *psy,
+			      enum power_supply_property psp,
+			      union power_supply_propval *val)
+{
+	if (!rg55_batt.valid)
+		return -ENODATA;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		val->intval = rg55_batt.status;
+		break;
+	case POWER_SUPPLY_PROP_HEALTH:
+		val->intval = rg55_batt.health;
+		break;
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = rg55_batt.present;
+		break;
+	case POWER_SUPPLY_PROP_TECHNOLOGY:
+		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		val->intval = rg55_batt.capacity;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		val->intval = rg55_batt.voltage_uv;
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = rg55_batt.current_ua;
+		break;
+	case POWER_SUPPLY_PROP_SCOPE:
+		val->intval = POWER_SUPPLY_SCOPE_SYSTEM;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int rg55_usb_get_prop(struct power_supply *psy,
+			     enum power_supply_property psp,
+			     union power_supply_propval *val)
+{
+	if (!rg55_batt.valid)
+		return -ENODATA;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE:
+		val->intval = rg55_batt.usb_online;
+		break;
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = rg55_batt.usb_online;
+		break;
+	case POWER_SUPPLY_PROP_SCOPE:
+		val->intval = POWER_SUPPLY_SCOPE_SYSTEM;
+		break;
+	case POWER_SUPPLY_PROP_USB_TYPE:
+		val->intval = rg55_batt.usb_online ?
+			      POWER_SUPPLY_USB_TYPE_SDP :
+			      POWER_SUPPLY_USB_TYPE_UNKNOWN;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static enum power_supply_property rg55_batt_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_SCOPE,
+};
+
+static enum power_supply_property rg55_usb_props[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_USB_TYPE,
+	POWER_SUPPLY_PROP_SCOPE,
+};
+
+static const struct power_supply_desc rg55_batt_desc = {
+	.name = "battery",
+	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.properties = rg55_batt_props,
+	.num_properties = ARRAY_SIZE(rg55_batt_props),
+	.get_property = rg55_batt_get_prop,
+};
+
+static const struct power_supply_desc rg55_usb_desc = {
+	.name = "usb",
+	.type = POWER_SUPPLY_TYPE_USB,
+	.properties = rg55_usb_props,
+	.num_properties = ARRAY_SIZE(rg55_usb_props),
+	.get_property = rg55_usb_get_prop,
+	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN) |
+		     BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_CDP),
+};
+
+static int rg55g1_psy_register(void)
+{
+	if (rg55_batt_psy)
+		return 0;
+
+	rg55_batt_psy = power_supply_register(NULL, &rg55_batt_desc, NULL);
+	if (IS_ERR(rg55_batt_psy)) {
+		pr_err("rg55g1: battery psy register failed %ld\n",
+		       PTR_ERR(rg55_batt_psy));
+		rg55_batt_psy = NULL;
+		return -ENODEV;
+	}
+
+	rg55_usb_psy = power_supply_register(NULL, &rg55_usb_desc, NULL);
+	if (IS_ERR(rg55_usb_psy)) {
+		pr_err("rg55g1: usb psy register failed %ld\n",
+		       PTR_ERR(rg55_usb_psy));
+		rg55_usb_psy = NULL;
+		/* battery alone is still useful */
+	}
+
+	pr_emerg("rg55g1: power_supply battery%s registered\n",
+		 rg55_usb_psy ? "+usb" : "");
+	return 0;
+}
+
 /**
- * rg55g1_enable_pm7250b_vbus() - enable Type-C VBUS via SPMI debug arb.
+ * rg55g1_enable_pm7250b_vbus() - bring up PM7250B Type-C dual-role via SPMI.
  *
- * Main arb EE ownership blocks HLOS writes to PM7250B OTG (SEA). Stock DT
- * exposes qcom,spmi-pmic-arb-debug which bypasses EE; use that for OTG.
- * PM4450s are rails only — VBUS boost is on the charger SID (PM7250B).
+ * Main arb EE ownership blocks HLOS writes to PM7250B (SEA). Stock DT
+ * exposes qcom,spmi-pmic-arb-debug which bypasses EE.
+ * PM4450s are rails only — OTG boost + USBIN charger are on PM7250B.
+ * Keepalive: sticky SRC+OTG (keyboard) or sink charge; no runtime PROBE-CHG.
  */
 static int rg55g1_enable_pm7250b_vbus(void)
 {
@@ -636,7 +1322,7 @@ static int rg55g1_enable_pm7250b_vbus(void)
 	static int last_ret = -ENODEV;
 	struct spmi_controller *main_ctrl, *dbg_ctrl;
 	struct spmi_controller *ctrl;
-	u8 sid, pmic_type, pmic_sub, type, subtype, cfg, cmd;
+	u8 sid, pmic_type, pmic_sub, type, subtype, cmd;
 	int found = 0, otg_sid = -1;
 	int ret;
 
@@ -721,7 +1407,7 @@ static int rg55g1_enable_pm7250b_vbus(void)
 		return last_ret;
 	}
 
-	/* Probe write path (debug arb preferred), then apply full OTG seq. */
+	/* Probe write path (debug arb preferred), then enter dual-role. */
 	ret = rg55g1_sid_write(ctrl, otg_sid, RG55_CMD_OTG, RG55_OTG_EN);
 	pr_emerg("rg55g1: sid=%d CMD_OTG probe via %s -> %d\n",
 		 otg_sid, dbg_ctrl ? "debug" : "main", ret);
@@ -755,13 +1441,15 @@ static int rg55g1_enable_pm7250b_vbus(void)
 	}
 
 	/*
-	 * TYPEC must stay EN_SRC_ONLY (not DISABLE). OTG enable follows
-	 * Android smblib: USBIN suspend + ENG halt set + DCDC_CMD_OTG.
+	 * Write path OK. Sticky OTG by default (keyboard). If a charger is
+	 * already present, enter sink charge instead.
 	 */
 	{
-		u8 ttype = 0, misc = 0, sm = 0, mode = 0, src = 0;
+		u8 ttype = 0, misc = 0, sm = 0, pp = 0;
 		u8 otg_type = 0, otg_sub = 0;
-		int wr;
+		u8 snk = 0, plugin = 0, apsd = 0;
+
+		(void)rg55g1_sid_write(ctrl, otg_sid, RG55_CMD_OTG, 0);
 
 		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_OTG_TYPE, &otg_type);
 		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_OTG_SUBTYPE, &otg_sub);
@@ -769,69 +1457,63 @@ static int rg55g1_enable_pm7250b_vbus(void)
 		pr_emerg("rg55g1: DCDC TYPE=0x%02x SUB=0x%02x TYPEC_TYPE=0x%02x\n",
 			 otg_type, otg_sub, ttype);
 
-		rg55g1_status_vbus("TYPEC-SRC", 0x00ffff00);
-
-		/* Pulse DISABLE once, then lock SRC-only. */
-		wr = rg55g1_sid_write(ctrl, otg_sid, RG55_TYPEC_MODE_CFG,
-				      RG55_TYPEC_DISABLE_CMD);
-		msleep(5);
-		(void)rg55g1_sid_write(ctrl, otg_sid, RG55_TYPEC_CURRSRC_CFG,
-				       RG55_TYPEC_RP_1P5);
-		wr |= rg55g1_sid_write(ctrl, otg_sid, RG55_TYPEC_MODE_CFG,
-				       RG55_TYPEC_EN_SRC_ONLY);
-		(void)rg55g1_sid_write(ctrl, otg_sid, RG55_TYPEC_VCONN_CTL,
-				       RG55_TYPEC_VCONN_EN_SRC);
-		(void)rg55g1_sid_write(ctrl, otg_sid, RG55_TYPEC_EXIT_STATE,
-				       RG55_TYPEC_SEL_SRC_UPPER_REF | BIT(3));
-
-		rg55g1_vbus_force_otg(ctrl, otg_sid);
-		msleep(150);
+		/* One short sink peek so boot-with-charger works. */
+		rg55g1_status_vbus("PROBE-CHG", 0x00ffff00);
+		if (rg55g1_vbus_probe_charger_ms(ctrl, otg_sid,
+						 RG55_BOOT_CHG_PROBE_MS)) {
+			rg55g1_vbus_force_charge(ctrl, otg_sid);
+		} else {
+			rg55g1_status_vbus("TYPEC-OTG", 0x00ffff00);
+			rg55g1_vbus_force_otg(ctrl, otg_sid);
+		}
+		msleep(50);
 
 		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_MISC_STATUS,
 				      &misc);
 		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_SM_STATUS, &sm);
-		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_MODE_CFG,
-				      &mode);
-		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_SRC_STATUS,
-				      &src);
+		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_POWER_PATH_STATUS,
+				      &pp);
 		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_CMD_OTG, &cmd);
+		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_SNK_STATUS, &snk);
+		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_USBIN_INT_RT_STS,
+				      &plugin);
+		(void)rg55g1_sid_read(ctrl, otg_sid, RG55_APSD_RESULT, &apsd);
+		(void)snk;
+		(void)plugin;
+		(void)apsd;
 
-		if (!(mode & RG55_TYPEC_EN_SRC_ONLY)) {
-			(void)rg55g1_sid_write(ctrl, otg_sid, RG55_TYPEC_MODE_CFG,
-					       RG55_TYPEC_EN_SRC_ONLY);
-			rg55g1_vbus_force_otg(ctrl, otg_sid);
-			msleep(50);
-			(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_MODE_CFG,
-					      &mode);
-			(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_MISC_STATUS,
-					      &misc);
-			(void)rg55g1_sid_read(ctrl, otg_sid, RG55_TYPEC_SM_STATUS,
-					      &sm);
-			(void)rg55g1_sid_read(ctrl, otg_sid, RG55_CMD_OTG, &cmd);
-		}
-
-		pr_emerg("rg55g1: final misc=0x%02x sm=0x%02x mode=0x%02x "
-			 "CMD=0x%02x src=0x%02x (wr=%d)\n",
-			 misc, sm, mode, cmd, src, wr);
+		pr_emerg("rg55g1: dual-role misc=0x%02x sm=0x%02x pp=0x%02x "
+			 "CMD=0x%02x role=%d\n",
+			 misc, sm, pp, cmd, vbus_keep_role);
 
 		vbus_keep_ctrl = ctrl;
 		vbus_keep_sid = otg_sid;
+		vbus_chg_probe_at = jiffies +
+			msecs_to_jiffies(RG55_CHG_FIRST_PROBE_MS);
+		vbus_chg_idle_ticks = 0;
+		rg55g1_qg_probe(ctrl, otg_sid);
+		(void)rg55g1_psy_register();
+		rg55g1_batt_update_and_show(ctrl, otg_sid);
 		schedule_delayed_work(&vbus_keep_work, msecs_to_jiffies(500));
 
-		snprintf(last, sizeof(last), "k%02X/S%d/A%d/C%d",
-			 cmd,
-			 !!(misc & RG55_TYPEC_SNK_SRC_MODE),
-			 !!(sm & RG55_TYPEC_ATTACH_STATE),
-			 !!(misc & RG55_TYPEC_CC_ATTACHED));
-		if ((cmd & RG55_OTG_EN) && (misc & RG55_TYPEC_SNK_SRC_MODE)) {
+		if (vbus_keep_role == RG55_VBUS_ROLE_CHG) {
+			snprintf(last, sizeof(last), "CHG-s%d", otg_sid);
 			last_color = 0x0000ff00;
 			last_ret = 0;
-		} else if (misc & RG55_TYPEC_CC_ATTACHED) {
-			last_color = 0x00ffff00;
-			last_ret = -EAGAIN;
+		} else if (vbus_keep_role == RG55_VBUS_ROLE_OTG &&
+			   (cmd & RG55_OTG_EN) &&
+			   (misc & RG55_TYPEC_SNK_SRC_MODE)) {
+			snprintf(last, sizeof(last), "k%02X/S%d/A%d/C%d",
+				 cmd,
+				 !!(misc & RG55_TYPEC_SNK_SRC_MODE),
+				 !!(sm & RG55_TYPEC_ATTACH_STATE),
+				 !!(misc & RG55_TYPEC_CC_ATTACHED));
+			last_color = 0x0000ff00;
+			last_ret = 0;
 		} else {
-			last_color = 0x00ff8000;
-			last_ret = -EAGAIN;
+			snprintf(last, sizeof(last), "RDY-s%d", otg_sid);
+			last_color = 0x00808080;
+			last_ret = 0;
 		}
 		rg55g1_status_vbus(last, last_color);
 		return last_ret;
@@ -1634,7 +2316,7 @@ int rg55g1_bringup_usb(void)
 	rg55g1_disable_eud();
 	rg55g1_hsphy_force_wake();
 
-	/* Type-C 5V from PM7250B OTG boost — do this before/with host. */
+	/* Type-C dual-role (OTG keyboard / USB sink charge) on PM7250B. */
 	(void)rg55g1_enable_pm7250b_vbus();
 
 	soc = of_find_node_by_path("/soc");
@@ -1747,14 +2429,14 @@ int rg55g1_bringup_usb(void)
 	driver_deferred_probe_trigger();
 	msleep(200);
 
-	/* Re-assert OTG after USB clocks/host are up (host probe can drop it). */
+	/* Refresh dual-role after USB clocks/host are up. */
 	rg55g1_status("USB-VBUS", 0x00ffff00);
 	(void)rg55g1_enable_pm7250b_vbus();
 	/* EUD may have been re-enabled by firmware; clear again. */
 	rg55g1_disable_eud();
 	rg55g1_usb_phy_clk_reset();
 	rg55g1_hsphy_force_wake();
-	/* Kick keepalive immediately with fresh writes */
+	/* Kick keepalive immediately for role re-decide */
 	if (vbus_keep_ctrl)
 		mod_delayed_work(system_wq, &vbus_keep_work, 0);
 
