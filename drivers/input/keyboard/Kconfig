@@ -232,6 +232,17 @@ config KEYBOARD_EP93XX
 	  To compile this driver as a module, choose M here: the
 	  module will be called ep93xx_keypad.
 
+config KEYBOARD_RG55G1
+	tristate "Anbernic RG55G1 power/volume keys"
+	depends on OF && SPMI
+	help
+	  Polled KEY_POWER / KEY_VOLUMEDOWN (PMK8350 PON) and
+	  KEY_VOLUMEUP (TLMM gpio53) for Anbernic RG55G1 bring-up
+	  (compatible = "anbernic,rg55g1-keys").
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called rg55g1_keys.
+
 config KEYBOARD_GPIO
 	tristate "GPIO Buttons"
 	depends on GPIOLIB || COMPILE_TEST

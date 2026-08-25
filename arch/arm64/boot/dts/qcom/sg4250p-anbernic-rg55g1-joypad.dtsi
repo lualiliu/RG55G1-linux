@@ -36,6 +36,15 @@
 		bias-disable;
 		output-high;
 	};
+
+	/* Volume-up from stock ravelin-pmic-overlay (gpio53) */
+	gpio_key_vol_up: gpio-key-vol-up {
+		pins = "gpio53";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
 };
 
 /*
@@ -83,6 +92,22 @@
 };
 
 &{/soc} {
+	/*
+	 * Power + volume keys from stock ravelin-pmic-overlay:
+	 *   pwrkey  -> KEY_POWER      (PMK8350 PON)
+	 *   resin   -> KEY_VOLUMEDOWN (PMK8350 PON)
+	 *   vol_up  -> KEY_VOLUMEUP   (TLMM gpio53)
+	 * Creates one /dev/input/event* device (rg55g1-keys).
+	 */
+	rg55g1_keys: rg55g1-keys {
+		compatible = "anbernic,rg55g1-keys";
+		status = "okay";
+		poll-interval = <20>;
+		vol-up-gpios = <&{/soc/pinctrl@f000000} 53 GPIO_ACTIVE_LOW>;
+		qcom,spmi-sid = <0>;
+		qcom,pon-base = <0x1300>;
+	};
+
 	singleadc_joypad: singleadc-joypad {
 		compatible = "singleadc-joypad";
 		status = "okay";

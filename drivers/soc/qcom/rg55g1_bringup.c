@@ -2327,6 +2327,39 @@ static int rg55g1_create_of_dev(struct device_node *np, const char *tag)
 }
 
 /**
+ * rg55g1_bringup_keys() - power/volume keys -> /dev/input/event*
+ *
+ * Stock overlay: pmk8350 pwrkey/resin + gpio-keys vol_up@gpio53.
+ * Do not use gpio-keys / pinctrl-sm4450 (TLMM gpiochip panics).
+ */
+static int rg55g1_bringup_keys(void)
+{
+	struct device_node *keys;
+	int n = 0;
+
+	rg55g1_status("KEY-PREP", 0x00ff8000);
+
+	keys = of_find_compatible_node(NULL, NULL, "anbernic,rg55g1-keys");
+	if (!keys) {
+		rg55g1_status("KEY-NODT", 0x00ff0000);
+		pr_emerg("rg55g1: rg55g1-keys DT node missing\n");
+		return 0;
+	}
+
+	rg55g1_force_status(keys, "okay");
+	n += rg55g1_create_of_dev(keys, "keys");
+	of_node_put(keys);
+
+	driver_deferred_probe_trigger();
+	msleep(50);
+
+	rg55g1_status(n ? "KEY-OK" : "KEY-FAIL",
+		      n ? 0x0000ff00 : 0x00ff0000);
+	pr_emerg("rg55g1: keys bringup done (%d)\n", n);
+	return n;
+}
+
+/**
  * rg55g1_bringup_joypad() - clocks/pinmux + singleadc-joypad for /dev/input
  *
  * Do not probe qcom,sm4450-tlmm (gpiochip panics). Buttons + MCU SPI use
@@ -2630,6 +2663,9 @@ int rg55g1_bringup_usb(void)
 	msleep(500);
 	driver_deferred_probe_trigger();
 	msleep(500);
+
+	/* Power/volume keys need SPMI (same path as VBUS) + TLMM MMIO. */
+	n += rg55g1_bringup_keys();
 
 	/* Gamepad after GCC clocks are available for GENI SPI. */
 	n += rg55g1_bringup_joypad();
