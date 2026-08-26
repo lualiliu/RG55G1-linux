@@ -7,8 +7,10 @@
 
 #include <linux/bits.h>
 #include <linux/bitfield.h>
+#include <linux/blkdev.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/export.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/init.h>
@@ -1780,10 +1782,17 @@ static int rg55g1_enable_sd_rails(void)
 		{ "ldob28", 1800000 },
 	};
 	struct tcs_cmd cmds[4];
-	int i, n = 0, ret, ok = 0;
+	int i, n = 0, ret, ok = 0, tries;
 
+	for (tries = 0; tries < 20; tries++) {
+		if (!cmd_db_ready())
+			break;
+		rg55g1_status("SD-LDO?", 0x00ff8000);
+		msleep(50);
+	}
 	if (cmd_db_ready()) {
-		rg55g1_status("SD-LDO!", 0x00ff8000);
+		rg55g1_status("SD-LDO!", 0x00ff0000);
+		pr_emerg("rg55g1: cmd-db not ready, skip SD LDO vote\n");
 		return -EAGAIN;
 	}
 
@@ -1812,6 +1821,63 @@ static int rg55g1_enable_sd_rails(void)
 	pr_emerg("rg55g1: SD RPMh vote (%d cmds, %d rails) -> %d\n", n, ok, ret);
 	usleep_range(2000, 3000);
 	return ret;
+}
+
+/**
+ * rg55g1_sdcc_clk_force() - ungated SDCC2 like USB phy bring-up.
+ */
+static void rg55g1_sdcc_clk_force(void)
+{
+	struct device_node *gcc_np;
+	void __iomem *gcc;
+	u32 bcr;
+	int i;
+	static const u32 clk_ids[] = {
+		GCC_SDCC2_AHB_CLK,
+		GCC_SDCC2_APPS_CLK,
+		GCC_SDCC2_APPS_CLK_SRC,
+	};
+
+	gcc_np = of_find_compatible_node(NULL, NULL, "qcom,sm4450-gcc");
+	if (!gcc_np)
+		gcc_np = of_find_compatible_node(NULL, NULL, "qcom,ravelin-gcc");
+
+	if (gcc_np) {
+		for (i = 0; i < ARRAY_SIZE(clk_ids); i++) {
+			struct of_phandle_args args = { };
+			struct clk *clk;
+
+			args.np = gcc_np;
+			args.args[0] = clk_ids[i];
+			args.args_count = 1;
+			clk = of_clk_get_from_provider(&args);
+			if (IS_ERR(clk))
+				continue;
+			if (clk_prepare_enable(clk))
+				clk_put(clk);
+			/* leak enable vote intentionally for bring-up */
+		}
+		of_node_put(gcc_np);
+	}
+
+	gcc = ioremap(0x00100000, 0xa0000);
+	if (!gcc) {
+		pr_emerg("rg55g1: GCC ioremap failed (SDCC)\n");
+		return;
+	}
+
+	writel(1, gcc + 0x2400c); /* GCC_SDCC2_AHB_CBCR */
+	writel(1, gcc + 0x24004); /* GCC_SDCC2_APPS_CBCR */
+
+	bcr = readl(gcc + 0x24000); /* GCC_SDCC2_BCR */
+	writel(1, gcc + 0x24000);
+	udelay(200);
+	writel(0, gcc + 0x24000);
+	udelay(200);
+
+	pr_emerg("rg55g1: SDCC2 BCR was 0x%x -> 0, clocks forced\n", bcr);
+	rg55g1_status("SD-CLK", 0x00ffff00);
+	iounmap(gcc);
 }
 
 /**
@@ -2175,10 +2241,11 @@ static int rg55g1_bringup_mmc(void)
 {
 	struct device_node *soc, *child, *gcc;
 	u32 gcc_ph = 0;
-	int n = 0;
+	int n = 0, i;
 
 	rg55g1_status("MMC-PREP", 0x00ff8000);
 	(void)rg55g1_enable_sd_rails();
+	rg55g1_sdcc_clk_force();
 
 	gcc = of_find_compatible_node(NULL, NULL, "qcom,sm4450-gcc");
 	if (!gcc)
@@ -2212,14 +2279,12 @@ static int rg55g1_bringup_mmc(void)
 		}
 
 		rg55g1_force_status(child, "okay");
-		rg55g1_remove_prop(child, "non-removable");
 		/*
-		 * Poll-based CD (broken-cd): SDHCI_QUIRK_BROKEN_CARD_DETECTION
-		 * also sets MMC_CAP_NEEDS_POLL. Card presence is checked by
-		 * CMD13; yank is reported as "card removed" then re-probed.
-		 * cd-gpios need TLMM/pinctrl which we strip to avoid defer.
+		 * SD stays in the slot; avoid broken-cd polling (CMD13 every
+		 * second) which hits the controller after runtime suspend.
 		 */
-		rg55g1_set_string_prop(child, "broken-cd", "");
+		rg55g1_set_string_prop(child, "non-removable", "");
+		rg55g1_remove_prop(child, "broken-cd");
 		rg55g1_set_string_prop(child, "qcom,force-pio", "");
 
 		/* Avoid -EPROBE_DEFER on missing providers. */
@@ -2246,7 +2311,7 @@ static int rg55g1_bringup_mmc(void)
 		rg55g1_remove_prop(child, "qcom,ice-clk-rates");
 		rg55g1_remove_prop(child, "qcom,devfreq,freq-table");
 		/* Limit init speed until regulators/pinctrl are wired. */
-		rg55g1_set_u32_prop(child, "max-frequency", 50000000);
+		rg55g1_set_u32_prop(child, "max-frequency", 25000000);
 
 		if (gcc_ph) {
 			clocks[0] = gcc_ph;
@@ -2299,6 +2364,33 @@ static int rg55g1_bringup_mmc(void)
 		}
 	}
 	of_node_put(soc);
+
+	/* Sync SDHCI probe; poll until mmcblk shows (or timeout).
+	 * Do not wait_for_device_probe() — USB async probes can block forever.
+	 */
+	driver_deferred_probe_trigger();
+	for (i = 0; i < 40; i++) {
+		struct device *d;
+
+		d = class_find_device_by_name(&block_class, "mmcblk0");
+		if (!d)
+			d = class_find_device_by_name(&block_class, "mmcblk1");
+		if (d) {
+			put_device(d);
+			pr_emerg("rg55g1: mmcblk ready after %d00ms\n", i);
+			rg55g1_status("MMC-BLK", 0x0000ff00);
+			break;
+		}
+		if (i == 0 || i == 39)
+			pr_emerg("rg55g1: waiting for mmcblk* (%d/40)\n", i + 1);
+		msleep(100);
+		if ((i & 3) == 3)
+			driver_deferred_probe_trigger();
+	}
+	if (i >= 40) {
+		pr_emerg("rg55g1: no mmcblk* after MMC bringup\n");
+		rg55g1_status("MMC-NOBLK", 0x00ff0000);
+	}
 
 	rg55g1_status(n ? "MMC-DEV" : "MMC-NONE",
 		      n ? 0x0000ff00 : 0x00ff0000);

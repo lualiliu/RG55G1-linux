@@ -1585,7 +1585,7 @@ static void ovl_inode_init_once(void *foo)
 	inode_init_once(&oi->vfs_inode);
 }
 
-static int __init ovl_init(void)
+int __init ovl_init(void)
 {
 	int err;
 

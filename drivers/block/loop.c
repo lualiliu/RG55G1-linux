@@ -2239,7 +2239,8 @@ static struct miscdevice loop_misc = {
 MODULE_ALIAS_MISCDEV(LOOP_CTRL_MINOR);
 MODULE_ALIAS("devname:loop-control");
 
-static int __init loop_init(void)
+/* Non-static: called from rg55g1_subsys_bringup after genhd/blk-mq. */
+int __init loop_init(void)
 {
 	int i;
 	int err;

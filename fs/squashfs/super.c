@@ -641,7 +641,7 @@ static void destroy_inodecache(void)
 }
 
 
-static int __init init_squashfs_fs(void)
+int __init init_squashfs_fs(void)
 {
 	int err = init_inodecache();
 

@@ -313,6 +313,8 @@ struct sdhci_msm_host {
 	u32 ddr_config;
 	bool vqmmc_enabled;
 	bool non_cqe_ice_init_done;
+	/* RG55G1 bring-up: no ICC/OPP — keep clocks on, skip autosuspend. */
+	bool no_runtime_pm;
 };
 
 static const struct sdhci_msm_offset *sdhci_priv_msm_offset(struct sdhci_host *host)
@@ -2608,6 +2610,12 @@ static inline void sdhci_msm_get_of_property(struct platform_device *pdev,
 		host->quirks |= SDHCI_QUIRK_BROKEN_ADMA | SDHCI_QUIRK_BROKEN_DMA |
 				SDHCI_QUIRK_NO_LED;
 		host->quirks2 |= SDHCI_QUIRK2_BROKEN_64_BIT_DMA;
+		/*
+		 * Autosuspend gates core/iface clocks and OPP/ICC restore fails
+		 * without stock interconnects → "Timeout waiting for hardware
+		 * interrupt" on the next I/O after ~50ms idle.
+		 */
+		msm_host->no_runtime_pm = true;
 	}
 }
 
@@ -2885,12 +2893,14 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	/* Set the timeout value to max possible */
 	host->max_timeout_count = 0xF;
 
-	pm_runtime_get_noresume(&pdev->dev);
-	pm_runtime_set_active(&pdev->dev);
-	pm_runtime_enable(&pdev->dev);
-	pm_runtime_set_autosuspend_delay(&pdev->dev,
-					 MSM_MMC_AUTOSUSPEND_DELAY_MS);
-	pm_runtime_use_autosuspend(&pdev->dev);
+	if (!msm_host->no_runtime_pm) {
+		pm_runtime_get_noresume(&pdev->dev);
+		pm_runtime_set_active(&pdev->dev);
+		pm_runtime_enable(&pdev->dev);
+		pm_runtime_set_autosuspend_delay(&pdev->dev,
+						 MSM_MMC_AUTOSUSPEND_DELAY_MS);
+		pm_runtime_use_autosuspend(&pdev->dev);
+	}
 
 	host->mmc_host_ops.start_signal_voltage_switch =
 		sdhci_msm_start_signal_voltage_switch;
@@ -2902,14 +2912,17 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	if (ret)
 		goto pm_runtime_disable;
 
-	pm_runtime_put_autosuspend(&pdev->dev);
+	if (!msm_host->no_runtime_pm)
+		pm_runtime_put_autosuspend(&pdev->dev);
 
 	return 0;
 
 pm_runtime_disable:
-	pm_runtime_disable(&pdev->dev);
-	pm_runtime_set_suspended(&pdev->dev);
-	pm_runtime_put_noidle(&pdev->dev);
+	if (!msm_host->no_runtime_pm) {
+		pm_runtime_disable(&pdev->dev);
+		pm_runtime_set_suspended(&pdev->dev);
+		pm_runtime_put_noidle(&pdev->dev);
+	}
 clk_disable:
 	clk_bulk_disable_unprepare(ARRAY_SIZE(msm_host->bulk_clks),
 				   msm_host->bulk_clks);
@@ -2929,9 +2942,11 @@ static void sdhci_msm_remove(struct platform_device *pdev)
 
 	sdhci_remove_host(host, dead);
 
-	pm_runtime_get_sync(&pdev->dev);
-	pm_runtime_disable(&pdev->dev);
-	pm_runtime_put_noidle(&pdev->dev);
+	if (!msm_host->no_runtime_pm) {
+		pm_runtime_get_sync(&pdev->dev);
+		pm_runtime_disable(&pdev->dev);
+		pm_runtime_put_noidle(&pdev->dev);
+	}
 
 	clk_bulk_disable_unprepare(ARRAY_SIZE(msm_host->bulk_clks),
 				   msm_host->bulk_clks);
@@ -3005,7 +3020,8 @@ static struct platform_driver sdhci_msm_driver = {
 		   .name = "sdhci_msm",
 		   .of_match_table = sdhci_msm_dt_match,
 		   .pm = pm_ptr(&sdhci_msm_pm_ops),
-		   .probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		   /* RG55G1: sync probe so mmcblk exists before Rocknix /init. */
+		   .probe_type = PROBE_FORCE_SYNCHRONOUS,
 	},
 };
 

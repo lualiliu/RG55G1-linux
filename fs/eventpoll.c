@@ -3009,4 +3009,5 @@ static int __init eventpoll_init(void)
 
 	return 0;
 }
-fs_initcall(eventpoll_init);
+/* RG55G1 skips LV5 (fs_initcall); systemd needs epoll slabs. */
+core_initcall(eventpoll_init);

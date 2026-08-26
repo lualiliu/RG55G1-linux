@@ -354,5 +354,6 @@ static int __init anon_inode_init(void)
 	return 0;
 }
 
-fs_initcall(anon_inode_init);
+/* RG55G1 skips LV5 (fs_initcall); systemd epoll needs anon_inode. */
+core_initcall(anon_inode_init);
 

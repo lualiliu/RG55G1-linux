@@ -815,7 +815,8 @@ SYSCALL_DEFINE2(inotify_rm_watch, int, fd, __s32, wd)
  * error because we have compiled-in VFS hooks.  So an (unlikely) failure here
  * must result in panic().
  */
-static int __init inotify_user_setup(void)
+/* Non-static: RG55G1 calls from rg55g1_subsys_bringup (LV5 skipped). */
+int __init inotify_user_setup(void)
 {
 	unsigned long watches_max;
 	struct sysinfo si;

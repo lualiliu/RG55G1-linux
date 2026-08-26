@@ -25,4 +25,4 @@ static int __init proc_cpuinfo_init(void)
 	proc_create("cpuinfo", 0, NULL, &cpuinfo_proc_ops);
 	return 0;
 }
-fs_initcall(proc_cpuinfo_init);
+core_initcall(proc_cpuinfo_init); /* RG55G1: was fs_initcall, LV5 skipped */

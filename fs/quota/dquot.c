@@ -3019,7 +3019,8 @@ static const struct ctl_table fs_dqstats_table[] = {
 #endif
 };
 
-static int __init dquot_init(void)
+/* Non-static: RG55G1 calls this from rg55g1_subsys_bringup (LV5 skipped). */
+int __init dquot_init(void)
 {
 	int i, ret;
 	unsigned long nr_hash;

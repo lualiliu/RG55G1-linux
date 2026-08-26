@@ -60,4 +60,4 @@ static int __init proc_kmsg_init(void)
 	proc_create("kmsg", S_IRUSR, NULL, &kmsg_proc_ops);
 	return 0;
 }
-fs_initcall(proc_kmsg_init);
+core_initcall(proc_kmsg_init); /* RG55G1: was fs_initcall, LV5 skipped */

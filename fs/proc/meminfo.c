@@ -185,4 +185,4 @@ static int __init proc_meminfo_init(void)
 	pde_make_permanent(pde);
 	return 0;
 }
-fs_initcall(proc_meminfo_init);
+core_initcall(proc_meminfo_init); /* RG55G1: was fs_initcall, LV5 skipped */

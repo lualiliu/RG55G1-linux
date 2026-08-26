@@ -29,6 +29,7 @@
 #include <linux/sort.h>
 
 #include <linux/uaccess.h>
+#include <linux/mutex.h>
 #include <asm/ioctls.h>
 
 #include "internal.h"
@@ -964,7 +965,58 @@ void free_pipe_info(struct pipe_inode_info *pipe)
 	kfree(pipe);
 }
 
-static struct vfsmount *pipe_mnt __ro_after_init;
+/*
+ * Keep in .bss (not __ro_after_init): writable so we can lazy-mount if the
+ * initcall is missed. Previously __ro_after_init left pipe_mnt NULL and
+ * pipe2() Oops'd in create_pipe_files.
+ */
+static struct vfsmount *pipe_mnt;
+static DEFINE_MUTEX(pipe_mnt_lock);
+static bool pipe_fs_registered;
+
+static const struct file_operations pipeanon_fops;
+
+static int pipefs_init_fs_context(struct fs_context *fc); /* fwd for type */
+
+static struct file_system_type pipe_fs_type = {
+	.name		= "pipefs",
+	.init_fs_context = pipefs_init_fs_context,
+	.kill_sb	= kill_anon_super,
+};
+
+/*
+ * Ensure pipefs is mounted. Safe after mark_rodata_ro because pipe_mnt is
+ * in .bss. Mirrors anon_inode: kern_mount() does not require prior
+ * register_filesystem(), but we still register for /proc/filesystems.
+ */
+static int ensure_pipe_mnt(void)
+{
+	struct vfsmount *mnt;
+	int err;
+
+	if (likely(READ_ONCE(pipe_mnt)))
+		return 0;
+
+	guard(mutex)(&pipe_mnt_lock);
+	if (pipe_mnt)
+		return 0;
+
+	if (!pipe_fs_registered) {
+		err = register_filesystem(&pipe_fs_type);
+		/* -EBUSY: already on the list (e.g. initcall raced) */
+		if (err && err != -EBUSY)
+			return err;
+		pipe_fs_registered = true;
+	}
+
+	mnt = kern_mount(&pipe_fs_type);
+	if (IS_ERR(mnt))
+		return PTR_ERR(mnt);
+
+	WRITE_ONCE(pipe_mnt, mnt);
+	pr_info("VFS: pipefs mounted\n");
+	return 0;
+}
 
 /*
  * pipefs_dname() is called from d_path().
@@ -979,12 +1031,15 @@ static const struct dentry_operations pipefs_dentry_operations = {
 	.d_dname	= pipefs_dname,
 };
 
-static const struct file_operations pipeanon_fops;
-
 static struct inode * get_pipe_inode(void)
 {
-	struct inode *inode = new_inode_pseudo(pipe_mnt->mnt_sb);
+	struct inode *inode;
 	struct pipe_inode_info *pipe;
+
+	if (ensure_pipe_mnt())
+		return NULL;
+
+	inode = new_inode_pseudo(pipe_mnt->mnt_sb);
 
 	if (!inode)
 		goto fail_inode;
@@ -1571,12 +1626,6 @@ static int pipefs_init_fs_context(struct fs_context *fc)
 	return 0;
 }
 
-static struct file_system_type pipe_fs_type = {
-	.name		= "pipefs",
-	.init_fs_context = pipefs_init_fs_context,
-	.kill_sb	= kill_anon_super,
-};
-
 #ifdef CONFIG_SYSCTL
 
 static ulong round_pipe_size_ul(ulong size)
@@ -1632,19 +1681,15 @@ static const struct ctl_table fs_pipe_sysctls[] = {
 
 static int __init init_pipe_fs(void)
 {
-	int err = register_filesystem(&pipe_fs_type);
+	int err = ensure_pipe_mnt();
 
-	if (!err) {
-		pipe_mnt = kern_mount(&pipe_fs_type);
-		if (IS_ERR(pipe_mnt)) {
-			err = PTR_ERR(pipe_mnt);
-			unregister_filesystem(&pipe_fs_type);
-		}
-	}
+	if (err)
+		panic("VFS: pipefs init failed (%d)\n", err);
 #ifdef CONFIG_SYSCTL
 	register_sysctl_init("fs", fs_pipe_sysctls);
 #endif
-	return err;
+	return 0;
 }
 
-fs_initcall(init_pipe_fs);
+/* Run early; create_pipe_files also lazy-mounts if this is skipped. */
+rootfs_initcall(init_pipe_fs);

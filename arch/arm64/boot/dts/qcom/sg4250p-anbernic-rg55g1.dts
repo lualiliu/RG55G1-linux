@@ -7665,7 +7665,6 @@
 			interrupt-names = "hc_irq\0pwr_irq";
 			bus-width = <4>;
 			no-sdio;
-			no-mmc;
 			broken-cd;
 			clocks = <36 101 36 102>;
 			clock-names = "iface\0core";

@@ -423,7 +423,8 @@ void mb_cache_destroy(struct mb_cache *cache)
 }
 EXPORT_SYMBOL(mb_cache_destroy);
 
-static int __init mbcache_init(void)
+/* Non-static: RG55G1 calls this from rg55g1_subsys_bringup (LV4+ skipped). */
+int __init mbcache_init(void)
 {
 	mb_entry_cache = KMEM_CACHE(mb_cache_entry, SLAB_RECLAIM_ACCOUNT);
 	if (!mb_entry_cache)

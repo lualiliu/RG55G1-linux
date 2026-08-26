@@ -177,4 +177,4 @@ static int __init proc_stat_init(void)
 	proc_create("stat", 0, NULL, &stat_proc_ops);
 	return 0;
 }
-fs_initcall(proc_stat_init);
+core_initcall(proc_stat_init); /* RG55G1: was fs_initcall, LV5 skipped */

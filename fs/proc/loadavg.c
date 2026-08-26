@@ -34,4 +34,4 @@ static int __init proc_loadavg_init(void)
 	pde_make_permanent(pde);
 	return 0;
 }
-fs_initcall(proc_loadavg_init);
+core_initcall(proc_loadavg_init); /* RG55G1: was fs_initcall, LV5 skipped */

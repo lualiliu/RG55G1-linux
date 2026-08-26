@@ -3033,7 +3033,8 @@ static void jbd2_journal_destroy_caches(void)
 	jbd2_journal_destroy_transaction_cache();
 }
 
-static int __init journal_init(void)
+/* Non-static: RG55G1 calls this from rg55g1_subsys_bringup (LV4+ skipped). */
+int __init journal_init(void)
 {
 	int ret;
 

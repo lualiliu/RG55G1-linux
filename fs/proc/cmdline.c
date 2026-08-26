@@ -21,4 +21,5 @@ static int __init proc_cmdline_init(void)
 	pde->size = saved_command_line_len + 1;
 	return 0;
 }
-fs_initcall(proc_cmdline_init);
+/* RG55G1 skips LV5 (fs_initcall); cmdline must exist for systemd + init. */
+core_initcall(proc_cmdline_init);

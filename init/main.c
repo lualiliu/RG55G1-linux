@@ -1425,18 +1425,20 @@ static void __init do_initcalls(void)
 	rg55g1_status("INITCALLS", 0x00ff00ff);
 
 	/*
-	 * RG55G1: after arch (SKIP-OF) the stock DT path hangs in
-	 * subsys/fs/device initcalls. Run pure..arch only, force
-	 * embedded initramfs unpack, then continue to /init ash.
+	 * RG55G1: stock of_platform / device (LV6+) hangs. Run pure..fs
+	 * (LV0–LV5); keep OF populate skipped; manually finish LV6 filesystems
+	 * + USB/MMC after that.
 	 */
 	if (rg55g1_block_deferred) {
-		for (level = 0; level <= 3; level++) {
+		for (level = 0; level <= 5; level++) {
 			char tag[16];
 
 			snprintf(tag, sizeof(tag), "LV%d", level);
 			rg55g1_status(tag, 0x0080ff00);
 			strcpy(command_line, saved_command_line);
 			do_initcall_level(level, command_line);
+			snprintf(tag, sizeof(tag), "LV%d-OK", level);
+			rg55g1_status(tag, 0x0000ff00);
 		}
 		{
 			extern int __init rg55g1_splash_fbdev_bringup(void);
@@ -1445,12 +1447,13 @@ static void __init do_initcalls(void)
 			if (rg55g1_splash_fbdev_bringup())
 				rg55g1_status("FB-!", 0x00ff0000);
 		}
-		rg55g1_status("SKIP-SUB0", 0x00ff00ff);
+		rg55g1_status("SKIP-DEV", 0x00ff00ff);
 		rg55g1_force_populate_rootfs();
 
 		/*
-		 * Level-4 block subsys initcalls are skipped below; mmcblk
-		 * needs bio/genhd/blk-mq before SDHCI creates /dev/mmcblk*.
+		 * LV6 device_initcall skipped — bring up block FS helpers that
+		 * Rocknix needs (fat/ext4/loop/squashfs). LV4/LV5 already ran
+		 * bio/genhd/bdi/dquot/inotify via normal initcalls.
 		 */
 		{
 			extern int __init rg55g1_subsys_bringup(void);
@@ -1461,8 +1464,8 @@ static void __init do_initcalls(void)
 		}
 
 		/*
-		 * Full LV4/LV6 hang or BUG (kobject netns). USB stack drivers
-		 * were moved to arch_initcall; only populate USB devices here.
+		 * LV6 driver probe skipped; USB stack is arch_initcall — only
+		 * populate USB/MMC/keys devices here.
 		 */
 		{
 			extern int rg55g1_bringup_usb(void);
@@ -1476,7 +1479,6 @@ static void __init do_initcalls(void)
 			msleep(500);
 			rg55g1_status(n > 0 ? "USB-WAIT" : "USB-SKIP",
 				      0x0000ffff);
-			/* Pin VBUS sticky again after late XHCI/PORTSC lines. */
 			{
 				extern int rg55g1_vbus_refresh(void);
 
