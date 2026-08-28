@@ -54,8 +54,16 @@ static int msm_mdss_parse_data_bus_icc_path(struct device *dev,
 	struct icc_path *reg_bus_path;
 
 	path0 = devm_of_icc_get(dev, "mdp0-mem");
-	if (IS_ERR_OR_NULL(path0))
-		return PTR_ERR_OR_ZERO(path0);
+	if (IS_ERR(path0)) {
+		int err = PTR_ERR(path0);
+
+		if (err == -EPROBE_DEFER)
+			return err;
+		/* No ravelin ICC driver yet; display works without BW voting. */
+		if (err != -ENOENT)
+			dev_warn(dev, "mdp0-mem icc unavailable (%d), skipping\n", err);
+		return 0;
+	}
 
 	msm_mdss->mdp_path[0] = path0;
 	msm_mdss->num_mdp_paths = 1;
@@ -238,11 +246,14 @@ static int msm_mdss_enable(struct msm_mdss *msm_mdss)
 	 * the interconnect is enabled (non-zero bandwidth). Let's make sure
 	 * that the interconnects are at least at a minimum amount.
 	 */
-	for (i = 0; i < msm_mdss->num_mdp_paths; i++)
+	for (i = 0; i < msm_mdss->num_mdp_paths; i++) {
+		if (!msm_mdss->mdp_path[i])
+			continue;
 		icc_set_bw(msm_mdss->mdp_path[i], 0, Bps_to_icc(MIN_IB_BW));
+	}
 
-	icc_set_bw(msm_mdss->reg_bus_path, 0,
-		   msm_mdss->reg_bus_bw);
+	if (msm_mdss->reg_bus_path)
+		icc_set_bw(msm_mdss->reg_bus_path, 0, msm_mdss->reg_bus_bw);
 
 	/*
 	 * TODO:
@@ -284,8 +295,11 @@ static int msm_mdss_disable(struct msm_mdss *msm_mdss)
 
 	clk_bulk_disable_unprepare(msm_mdss->num_clocks, msm_mdss->clocks);
 
-	for (i = 0; i < msm_mdss->num_mdp_paths; i++)
+	for (i = 0; i < msm_mdss->num_mdp_paths; i++) {
+		if (!msm_mdss->mdp_path[i])
+			continue;
 		icc_set_bw(msm_mdss->mdp_path[i], 0, 0);
+	}
 
 	if (msm_mdss->reg_bus_path)
 		icc_set_bw(msm_mdss->reg_bus_path, 0, 0);
@@ -306,9 +320,15 @@ static void msm_mdss_destroy(struct msm_mdss *msm_mdss)
 	irq_set_chained_handler_and_data(irq, NULL, NULL);
 }
 
+extern bool rg55g1_skip_mdss_reset;
+extern bool rg55g1_skip_mdss_populate;
+
 static int msm_mdss_reset(struct device *dev)
 {
 	struct reset_control *reset;
+
+	if (rg55g1_skip_mdss_reset)
+		return 0;
 
 	reset = reset_control_get_optional_exclusive(dev, NULL);
 	if (!reset) {
@@ -485,11 +505,13 @@ static int mdss_probe(struct platform_device *pdev)
 	 * Populate the children devices, find the MDP5/DPU node, and then add
 	 * the interfaces to our components list.
 	 */
-	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
-	if (ret) {
-		DRM_DEV_ERROR(dev, "failed to populate children devices\n");
-		msm_mdss_destroy(mdss);
-		return ret;
+	if (!rg55g1_skip_mdss_populate) {
+		ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
+		if (ret) {
+			DRM_DEV_ERROR(dev, "failed to populate children devices\n");
+			msm_mdss_destroy(mdss);
+			return ret;
+		}
 	}
 
 	return 0;
@@ -552,6 +574,8 @@ static const struct of_device_id mdss_dt_match[] = {
 	{ .compatible = "qcom,sm8350-mdss", .data = &data_74k },
 	{ .compatible = "qcom,sm8450-mdss", .data = &data_74k },
 	{ .compatible = "qcom,sm8550-mdss", .data = &data_57k },
+	{ .compatible = "qcom,sm4450-mdss", .data = &data_74k },
+	{ .compatible = "qcom,ravelin-mdss", .data = &data_74k },
 	{ .compatible = "qcom,sm8650-mdss", .data = &data_57k },
 	{ .compatible = "qcom,sm8750-mdss", .data = &data_57k },
 	/* TODO: x1e8: Add reg_bus_bw with real value */

@@ -193,6 +193,8 @@ static void dsi_dev_remove(struct platform_device *pdev)
 
 static const struct of_device_id dt_match[] = {
 	{ .compatible = "qcom,mdss-dsi-ctrl" },
+	{ .compatible = "qcom,sm4450-dsi-ctrl" },
+	{ .compatible = "qcom,ravelin-dsi-ctrl" },
 
 	/* Deprecated, don't use */
 	{ .compatible = "qcom,dsi-ctrl-6g-qcm2290" },

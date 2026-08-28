@@ -3,7 +3,7 @@
  * Anbernic RG55G1 board DT — from Luali Liu
  *  with:
  *  - explicit /memory for mainline bootmem
- *  - simple-framebuffer @ 0xb8000000 for continuous splash console
+ *  - simple-framebuffer @ 0xb8000000 → simpledrm (/dev/dri/card0) + rg55g1_splash fbcon
  *  - board-id 0x1000b (Ravelin QRD)
  *
  * Do not #include sm4450.dtsi here; stock already describes the SoC.
@@ -25,7 +25,7 @@
 		#size-cells = <2>;
 		ranges;
 		stdout-path = "/chosen/framebuffer@b8000000";
-		bootargs = "console=tty0 console=ttyMSM0,115200n8 loglevel=6 log_buf_len=256K kernel.panic_on_rcu_stall=1 loop.max_part=7 pcie_ports=compat msm_rtb.filter=0x237 kasan=off rcupdate.rcu_expedited=1 rcu_nocbs=0-7 ftrace_dump_on_oops pstore.compress=none kpti=0 swiotlb=noforce cgroup.memory=nokmem,nosocket kswapd_per_node=2 slub_debug=- allow_file_spec_access cpufreq.default_governor=performance transparent_hugepage=never can.stats_timer=0 disable_dma32=on android12_only.will_be_removed_soon.memblock_nomap_remove=on pcie_ports=compat";
+		bootargs = "console=tty0 console=ttyMSM0,115200n8 loglevel=6 log_buf_len=256K kernel.panic_on_rcu_stall=1 loop.max_part=7 pcie_ports=compat msm_rtb.filter=0x237 kasan=off rcupdate.rcu_expedited=1 rcu_nocbs=0-7 ftrace_dump_on_oops pstore.compress=none kpti=0 swiotlb=noforce cgroup.memory=nokmem,nosocket kswapd_per_node=2 slub_debug=- allow_file_spec_access cpufreq.default_governor=performance transparent_hugepage=never can.stats_timer=0 disable_dma32=on android12_only.will_be_removed_soon.memblock_nomap_remove=on pcie_ports=compat rg55g1.msm=1";
 		phandle = <506>;
 		framebuffer@b8000000 {
 			compatible = "simple-framebuffer";
@@ -34,6 +34,7 @@
 			height = <1920>;
 			stride = <4320>;
 			format = "x8r8g8b8";
+			/* No clocks: ABL keeps the panel alive; dispcc is not populated. */
 		};
 	};
 
@@ -387,8 +388,7 @@
 		serial1 = "/soc/qcom,qup_uart@980000";
 		hsuart0 = "/soc/qcom,qup_uart@988000";
 		ufshc1 = "/soc/ufshc@1d84000";
-		mmc0 = "/soc/sdhci@7C4000";
-		mmc1 = "/soc/sdhci@8804000";
+		mmc0 = "/soc/sdhci@8804000";
 		spi3 = "/soc/spi@98c000";
 		phandle = <528>;
 	};
@@ -7606,14 +7606,9 @@
 			};
 		};
 
-		/*
-		 * eMMC (SDC1). Clocks/resets use mainline qcom,sm4450-gcc.h
-		 * indices (stock Android DT used different numbering).
-		 * Supplies/pinctrl/iommu/icc stripped for bring-up: BL left
-		 * rails/pins on; phys DMA via apps-smmu SID bypass.
-		 */
+		/* eMMC (SDC1) — not populated on RG55G1 */
 		sdhci@7C4000 {
-			status = "okay";
+			status = "disabled";
 			compatible = "qcom,sdhci-msm-v5";
 			reg = <0x7c4000 0x1000>;
 			reg-names = "hc";
@@ -7635,7 +7630,6 @@
 		};
 
 		sdhc2-opp-table {
-			status = "disabled";
 			compatible = "operating-points-v2";
 			phandle = <331>;
 
@@ -7653,23 +7647,34 @@
 		};
 
 		/*
-		 * SD card (SDC2). broken-cd: poll without TLMM cd-gpio yet.
-		 * GCC_SDCC2_AHB_CLK=101, GCC_SDCC2_APPS_CLK=102, BCR=17.
+		 * SD card slot (SDC2). Matches ROCKNIX sm4450-anbernic-rg55g1.dts:
+		 * L24B vmmc (pm6450_l24), L28B vqmmc (pm6450_l28), gpio101 CD.
+		 * Clocks: GCC_SDCC2_AHB=101, GCC_SDCC2_APPS=102, BCR=17, CXO=0.
 		 */
 		sdhci@8804000 {
 			status = "okay";
-			compatible = "qcom,sdhci-msm-v5";
+			compatible = "qcom,sm4450-sdhci", "qcom,sdhci-msm-v5";
 			reg = <0x8804000 0x1000>;
 			reg-names = "hc";
 			interrupts = <0 207 4 0 223 4>;
 			interrupt-names = "hc_irq\0pwr_irq";
-			bus-width = <4>;
-			no-sdio;
-			broken-cd;
-			clocks = <36 101 36 102>;
-			clock-names = "iface\0core";
+			clocks = <36 101 36 102 69 0>;
+			clock-names = "iface\0core\0xo";
 			resets = <36 17>;
 			reset-names = "core_reset";
+			pinctrl-0 = <762>;
+			pinctrl-1 = <763>;
+			pinctrl-names = "default\0sleep";
+			vmmc-supply = <677>;
+			vqmmc-supply = <680>;
+			cd-gpios = <294 101 1>;
+			bus-width = <4>;
+			no-sdio;
+			no-mmc;
+			qcom,dll-config = <0x7642c>;
+			qcom,ddr-config = <0x80040868>;
+			qcom,restore-after-cx-collapse;
+			operating-points-v2 = <331>;
 			phandle = <714>;
 		};
 
@@ -16662,3 +16667,4 @@
 };
 
 #include "sg4250p-anbernic-rg55g1-joypad.dtsi"
+#include "sg4250p-anbernic-rg55g1-display.dtsi"

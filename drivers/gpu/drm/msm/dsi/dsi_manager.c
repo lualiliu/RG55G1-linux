@@ -7,6 +7,11 @@
 
 #include "msm_kms.h"
 #include "dsi.h"
+#include "phy/dsi_phy.h"
+
+/* RG55G1 ABL continuous splash takeover */
+extern bool rg55g1_preserve_abl_display;
+extern bool rg55g1_abl_panel_ready;
 
 #define DSI_CLOCK_MASTER	DSI_0
 #define DSI_CLOCK_SLAVE		DSI_1
@@ -216,19 +221,56 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 	struct mipi_dsi_host *host = msm_dsi->host;
 	struct msm_dsi_phy_shared_timings phy_shared_timings[DSI_MAX];
 	bool is_bonded_dsi = IS_BONDED_DSI();
+	bool abl = rg55g1_preserve_abl_display;
+	bool keep_phy = abl || rg55g1_abl_panel_ready;
 	int ret;
 
 	DBG("id=%d", id);
 
-	ret = dsi_mgr_phy_enable(id, phy_shared_timings);
-	if (ret)
-		goto phy_en_fail;
+	memset(phy_shared_timings, 0, sizeof(phy_shared_timings));
 
+	/*
+	 * After splash INTF quiesce: keep ABL PHY locked (phy_enable resets
+	 * the PLL and, with skip-panel, causes TIMEOUT|FIFO). Still compute
+	 * shared timings so the DSI host can be reprogrammed to match the
+	 * Linux mode / DPU INTF restart.
+	 */
+	if (keep_phy) {
+		struct msm_dsi_phy_clk_request clk_req;
+		struct msm_dsi_dphy_timing timing;
+
+		pr_emerg("msm_dsi: skip phy_enable (ABL PHY keep)\n");
+		msm_dsi->phy_enabled = true;
+
+		msm_dsi_host_get_phy_clk_req(host, &clk_req, is_bonded_dsi);
+		if (!msm_dsi_dphy_timing_calc_v4(&timing, &clk_req)) {
+			phy_shared_timings[id] = timing.shared_timings;
+			pr_emerg("msm_dsi: shared timings clk_pre=%u clk_post=%u div2=%d\n",
+				 phy_shared_timings[id].clk_pre,
+				 phy_shared_timings[id].clk_post,
+				 phy_shared_timings[id].byte_intf_clk_div_2);
+		} else {
+			/* 4nm v4 always uses byte_intf = byte/2 */
+			phy_shared_timings[id].byte_intf_clk_div_2 = true;
+			pr_emerg("msm_dsi: shared timing calc failed, assume div2\n");
+		}
+	} else {
+		pr_emerg("msm_dsi: phy_enable begin\n");
+		ret = dsi_mgr_phy_enable(id, phy_shared_timings);
+		if (ret) {
+			pr_emerg("msm_dsi: phy_enable failed %d\n", ret);
+			goto phy_en_fail;
+		}
+		pr_emerg("msm_dsi: phy_enable done\n");
+	}
+
+	pr_emerg("msm_dsi: host_power_on begin\n");
 	ret = msm_dsi_host_power_on(host, &phy_shared_timings[id], is_bonded_dsi, msm_dsi->phy);
 	if (ret) {
 		pr_err("%s: power on host %d failed, %d\n", __func__, id, ret);
 		goto host_on_fail;
 	}
+	pr_emerg("msm_dsi: host_power_on done\n");
 
 	if (is_bonded_dsi && msm_dsi1) {
 		ret = msm_dsi_host_power_on(msm_dsi1->host,
@@ -244,16 +286,21 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 	 * Enable before preparing the panel, disable after unpreparing, so
 	 * that the panel can communicate over the DSI link.
 	 */
+	pr_emerg("msm_dsi: host_enable_irq\n");
 	msm_dsi_host_enable_irq(host);
 	if (is_bonded_dsi && msm_dsi1)
 		msm_dsi_host_enable_irq(msm_dsi1->host);
+	pr_emerg("msm_dsi: host_enable_irq done\n");
 
 	return 0;
 
 host1_on_fail:
 	msm_dsi_host_power_off(host);
 host_on_fail:
-	dsi_mgr_phy_disable(id);
+	if (!keep_phy)
+		dsi_mgr_phy_disable(id);
+	else
+		msm_dsi->phy_enabled = false;
 phy_en_fail:
 	return ret;
 }
@@ -279,8 +326,6 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 {
 	int id = dsi_mgr_bridge_get_id(bridge);
 	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
-	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
-	struct mipi_dsi_host *host = msm_dsi->host;
 	bool is_bonded_dsi = IS_BONDED_DSI();
 	int ret;
 
@@ -290,44 +335,71 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		return;
 
+	/*
+	 * Power on only — do not enable video mode yet. Panel prepare (init
+	 * DCS) runs after this when prepare_prev_first is set; enabling video
+	 * first causes VIDEO_MODE_ENGINE_BUSY waits that never complete
+	 * (MDP timing engine is not on yet) → "wait for video done timed out".
+	 */
+	pr_emerg("msm_dsi: bridge pre_enable id=%d (power_on)\n", id);
 	ret = dsi_mgr_bridge_power_on(bridge);
-	if (ret) {
+	if (ret)
 		dev_err(&msm_dsi->pdev->dev, "Power on failed: %d\n", ret);
-		return;
-	}
+	else
+		pr_emerg("msm_dsi: bridge pre_enable id=%d done\n", id);
+}
 
+static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
+{
+	int id = dsi_mgr_bridge_get_id(bridge);
+	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
+	struct mipi_dsi_host *host = msm_dsi->host;
+	bool is_bonded_dsi = IS_BONDED_DSI();
+	int ret;
+
+	DBG("id=%d", id);
+
+	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
+		return;
+
+	pr_emerg("msm_dsi: bridge enable id=%d (host video)\n", id);
 	ret = msm_dsi_host_enable(host);
 	if (ret) {
 		pr_err("%s: enable host %d failed, %d\n", __func__, id, ret);
-		goto host_en_fail;
+		return;
 	}
 
 	if (is_bonded_dsi && msm_dsi1) {
 		ret = msm_dsi_host_enable(msm_dsi1->host);
-		if (ret) {
+		if (ret)
 			pr_err("%s: enable host1 failed, %d\n", __func__, ret);
-			goto host1_en_fail;
-		}
 	}
-
-	return;
-
-host1_en_fail:
-	msm_dsi_host_disable(host);
-host_en_fail:
-	dsi_mgr_bridge_power_off(bridge);
+	pr_emerg("msm_dsi: bridge enable id=%d done\n", id);
 }
 
-void msm_dsi_manager_tpg_enable(void)
+static void dsi_mgr_bridge_disable(struct drm_bridge *bridge)
 {
-	struct msm_dsi *m_dsi = dsi_mgr_get_dsi(DSI_0);
-	struct msm_dsi *s_dsi = dsi_mgr_get_dsi(DSI_1);
+	int id = dsi_mgr_bridge_get_id(bridge);
+	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
+	struct mipi_dsi_host *host = msm_dsi->host;
+	bool is_bonded_dsi = IS_BONDED_DSI();
+	int ret;
 
-	/* if dual dsi, trigger tpg on master first then slave */
-	if (m_dsi) {
-		msm_dsi_host_test_pattern_en(m_dsi->host);
-		if (IS_BONDED_DSI() && s_dsi)
-			msm_dsi_host_test_pattern_en(s_dsi->host);
+	DBG("id=%d", id);
+
+	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
+		return;
+
+	ret = msm_dsi_host_disable(host);
+	if (ret)
+		pr_err("%s: host %d disable failed, %d\n", __func__, id, ret);
+
+	if (is_bonded_dsi && msm_dsi1) {
+		ret = msm_dsi_host_disable(msm_dsi1->host);
+		if (ret)
+			pr_err("%s: host1 disable failed, %d\n", __func__, ret);
 	}
 }
 
@@ -350,22 +422,12 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		goto disable_phy;
 
-	ret = msm_dsi_host_disable(host);
-	if (ret)
-		pr_err("%s: host %d disable failed, %d\n", __func__, id, ret);
-
-	if (is_bonded_dsi && msm_dsi1) {
-		ret = msm_dsi_host_disable(msm_dsi1->host);
-		if (ret)
-			pr_err("%s: host1 disable failed, %d\n", __func__, ret);
-	}
-
 	msm_dsi_host_disable_irq(host);
 	if (is_bonded_dsi && msm_dsi1)
 		msm_dsi_host_disable_irq(msm_dsi1->host);
 
-	/* Save PHY status if it is a clock source */
-	msm_dsi_phy_pll_save_state(msm_dsi->phy);
+	if (!rg55g1_preserve_abl_display)
+		msm_dsi_phy_pll_save_state(msm_dsi->phy);
 
 	ret = msm_dsi_host_power_off(host);
 	if (ret)
@@ -379,7 +441,24 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 	}
 
 disable_phy:
+	if (rg55g1_preserve_abl_display || rg55g1_abl_panel_ready) {
+		msm_dsi->phy_enabled = false;
+		return;
+	}
 	dsi_mgr_phy_disable(id);
+}
+
+void msm_dsi_manager_tpg_enable(void)
+{
+	struct msm_dsi *m_dsi = dsi_mgr_get_dsi(DSI_0);
+	struct msm_dsi *s_dsi = dsi_mgr_get_dsi(DSI_1);
+
+	/* if dual dsi, trigger tpg on master first then slave */
+	if (m_dsi) {
+		msm_dsi_host_test_pattern_en(m_dsi->host);
+		if (IS_BONDED_DSI() && s_dsi)
+			msm_dsi_host_test_pattern_en(s_dsi->host);
+	}
 }
 
 static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
@@ -447,6 +526,8 @@ static int dsi_mgr_bridge_attach(struct drm_bridge *bridge,
 static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.attach = dsi_mgr_bridge_attach,
 	.pre_enable = dsi_mgr_bridge_pre_enable,
+	.enable = dsi_mgr_bridge_enable,
+	.disable = dsi_mgr_bridge_disable,
 	.post_disable = dsi_mgr_bridge_post_disable,
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,

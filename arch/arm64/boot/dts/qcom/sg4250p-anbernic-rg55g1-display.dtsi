@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * RG55G1 upstream-style MSM display (SM4450 DPU + FT7131M DSI panel).
+ * Replaces disabled stock qcom,sde-kms / dsi-ctrl-hw flat nodes.
+ *
+ * Uses stock /soc/clock-controller@{100000,af00000} (GCC/DISPCC); do not
+ * duplicate those nodes here.
+ */
+#include <dt-bindings/clock/qcom,sm4450-dispcc.h>
+#include <dt-bindings/clock/qcom,sm4450-gcc.h>
+#include <dt-bindings/clock/qcom,dsi-phy-28nm.h>
+#include <dt-bindings/clock/qcom,rpmh.h>
+
+/ {
+	/*
+	 * Stock rpmhclk has no xo parent → bi_tcxo rate 0 →
+	 * "disp_cc_pll0: Rounded rate 0". Wire xo_board (76.8 MHz) so
+	 * sm4450 bi_tcxo_div4 reports 19.2 MHz.
+	 */
+	soc {
+		rsc@17a00000 {
+			qcom,rpmhclk {
+				compatible = "qcom,sm4450-rpmh-clk",
+					     "qcom,ravelin-rpmh-clk";
+				clocks = <&{/soc/clocks/xo_board}>;
+				clock-names = "xo";
+				#clock-cells = <1>;
+			};
+		};
+
+		/*
+		 * Fixed 19.2 MHz for DISPCC PLL parents. Avoids depending on
+		 * rpmhclk probe order / ARC vote during early USB bringup.
+		 */
+		bi_tcxo_19m2: bi-tcxo-19m2 {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <19200000>;
+		};
+
+		/*
+		 * DISPCC parent indices (dispcc-sm4450.c): 0 tcxo, 1 tcxo_ao,
+		 * 2 iface(GCC AHB), 3 sleep, 4 byte PLL, 5 pixel PLL.
+		 *
+		 * Real PHY phandles (not <0>): clk core leaves unresolved parents
+		 * as orphans until PHY registers, then assigned-clock-parents can
+		 * reparent. Probe order must be DISPCC → PHY (PHY needs AHB/XO).
+		 */
+		clock-controller@af00000 {
+			compatible = "qcom,sm4450-dispcc", "qcom,ravelin-dispcc", "syscon";
+			#power-domain-cells = <1>;
+			clocks = <&bi_tcxo_19m2>,
+				 <&bi_tcxo_19m2>,
+				 <&{/soc/clock-controller@100000} GCC_DISP_AHB_CLK>,
+				 <&{/soc/clocks/sleep_clk}>,
+				 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+				 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
+			clock-names = "bi_tcxo", "bi_tcxo_ao", "iface", "sleep_clk",
+				      "dsi0_phy_pll_out_byteclk", "dsi0_phy_pll_out_dsiclk";
+		};
+
+		/delete-node/ qcom,mdss_mdp@ae00000;
+		/delete-node/ qcom,mdss_dsi_ctrl0@ae94000;
+		/delete-node/ qcom,mdss_dsi_phy0@ae94900;
+		/delete-node/ qcom,sde_rscc@af20000;
+
+		/*
+		 * Stock kgsl matches msm GPU component hunt (qcom,kgsl-3d0).
+		 * Keep disabled until Adreno bring-up so DPU KMS can bind
+		 * with DSI alone. Also keep kgsl-smmu disabled — USB bringup
+		 * must not bind arm-smmu against firmware-owned SMMU MMIO.
+		 */
+		qcom,kgsl-3d0@3d00000 {
+			status = "disabled";
+		};
+
+		kgsl-smmu@3da0000 {
+			status = "disabled";
+		};
+
+		mdss: display-subsystem@ae00000 {
+			compatible = "qcom,sm4450-mdss", "qcom,ravelin-mdss";
+			reg = <0xae00000 0x1000>;
+			reg-names = "mdss";
+
+			interrupts = <0 83 4>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+
+			clocks = <&{/soc/clock-controller@af00000} DISP_CC_MDSS_AHB_CLK>,
+				 <&{/soc/clock-controller@100000} GCC_DISP_AHB_CLK>,
+				 <&{/soc/clock-controller@100000} GCC_DISP_HF_AXI_CLK>,
+				 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_MDP_CLK>;
+			clock-names = "iface", "bus", "nrt_bus", "core";
+
+			resets = <&{/soc/clock-controller@af00000} DISP_CC_MDSS_CORE_BCR>;
+
+			power-domains = <&{/soc/clock-controller@af00000} DISP_CC_MDSS_CORE_GDSC>;
+
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges;
+
+			status = "disabled";
+
+			/* PHY before DSI (dsi_get_phy needs phy pdev at probe) */
+			mdss_dsi0_phy: phy@ae94400 {
+				compatible = "qcom,sm4450-dsi-phy-4nm", "qcom,ravelin-dsi-phy-4nm";
+				/* Stock: phy @ae94400, pll @ae94900, lanes @ae94200 */
+				reg = <0xae94400 0xa00>,
+				      <0xae94200 0xa0>,
+				      <0xae94900 0x400>;
+				reg-names = "dsi_phy", "dsi_phy_lane", "dsi_pll";
+
+				clocks = <&{/soc/clock-controller@af00000} DISP_CC_MDSS_AHB_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_XO_CLK>;
+				clock-names = "iface", "ref";
+
+				#clock-cells = <1>;
+				#phy-cells = <0>;
+			};
+
+			mdss_mdp: display-controller@ae01000 {
+				compatible = "qcom,sm4450-dpu", "qcom,ravelin-dpu";
+				reg = <0xae01000 0x8f000>, <0xaeb0000 0x3000>;
+				reg-names = "mdp", "vbif";
+
+				interrupt-parent = <&mdss>;
+				interrupts = <0>;
+
+				clocks = <&{/soc/clock-controller@100000} GCC_DISP_AHB_CLK>,
+					 <&{/soc/clock-controller@100000} GCC_DISP_HF_AXI_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_AHB_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_MDP_LUT_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_MDP_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_VSYNC_CLK>;
+				clock-names = "bus", "nrt_bus", "iface",
+					      "lut", "core", "vsync";
+
+				assigned-clocks = <&{/soc/clock-controller@af00000} DISP_CC_MDSS_VSYNC_CLK>;
+				assigned-clock-rates = <19200000>;
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						dpu_intf1_out: endpoint {
+							remote-endpoint = <&mdss_dsi0_in>;
+						};
+					};
+				};
+			};
+
+			mdss_dsi0: dsi@ae94000 {
+				compatible = "qcom,sm4450-dsi-ctrl", "qcom,mdss-dsi-ctrl";
+				reg = <0xae94000 0x400>;
+				reg-names = "dsi_ctrl";
+
+				interrupt-parent = <&mdss>;
+				interrupts = <4>;
+
+				/*
+				 * Do NOT use assigned-clock-parents for BYTE/PCLK:
+				 * RCG cannot switch to DSI PHY PLL until PHY is
+				 * enabled (see dsi_link_clk_set_rate_6g_v2_9).
+				 */
+				clocks = <&{/soc/clock-controller@af00000} DISP_CC_MDSS_BYTE0_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_BYTE0_INTF_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_PCLK0_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_ESC0_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_AHB_CLK>,
+					 <&{/soc/clock-controller@100000} GCC_DISP_HF_AXI_CLK>,
+					 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
+					 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_BYTE0_CLK_SRC>,
+					 <&{/soc/clock-controller@af00000} DISP_CC_MDSS_PCLK0_CLK_SRC>;
+				clock-names = "byte", "byte_intf", "pixel",
+					      "core", "iface", "bus",
+					      "dsi_pll_pixel", "dsi_pll_byte",
+					      "byte_src", "pixel_src";
+
+				phys = <&mdss_dsi0_phy>;
+				phy-names = "dsi";
+
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						mdss_dsi0_in: endpoint {
+							remote-endpoint = <&dpu_intf1_out>;
+						};
+					};
+
+					port@1 {
+						reg = <1>;
+						mdss_dsi0_out: endpoint {
+							remote-endpoint = <&ft7131m_in>;
+						};
+					};
+				};
+
+				panel@0 {
+					compatible = "focaltech,ft7131m";
+					reg = <0>;
+
+					ports {
+						port {
+							ft7131m_in: endpoint {
+								remote-endpoint = <&mdss_dsi0_out>;
+							};
+						};
+					};
+				};
+			};
+		};
+	};
+};

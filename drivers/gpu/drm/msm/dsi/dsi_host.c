@@ -32,6 +32,10 @@
 #include "msm_gem.h"
 #include "phy/dsi_phy.h"
 
+/* RG55G1 ABL continuous splash takeover (drivers/soc/qcom/rg55g1_bringup.c) */
+extern bool rg55g1_preserve_abl_display;
+extern bool rg55g1_abl_panel_ready;
+
 #define DSI_RESET_TOGGLE_DELAY_MS 20
 
 static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc_config *dsc);
@@ -229,6 +233,34 @@ dsi_get_config(struct msm_dsi_host *msm_host)
 	}
 
 	cfg_hnd = msm_dsi_cfg_get(major, minor);
+	/*
+	 * SM4450: always use v2.9 ops so BYTE/PCLK are reparented to the PHY
+	 * PLL only after phy_enable (assigned-clock-parents is unsafe here).
+	 */
+	if (of_device_is_compatible(dev->of_node, "qcom,sm4450-dsi-ctrl") ||
+	    of_device_is_compatible(dev->of_node, "qcom,ravelin-dsi-ctrl")) {
+		const struct msm_dsi_cfg_handler *sm4450_hnd;
+
+		sm4450_hnd = msm_dsi_cfg_get(MSM_DSI_VER_MAJOR_6G,
+					     MSM_DSI_6G_VER_MINOR_V2_9_0);
+		if (sm4450_hnd) {
+			if (!cfg_hnd)
+				dev_warn(dev,
+					 "%s: unknown DSI rev %x:%x, using SM8650 v2.9 cfg\n",
+					 __func__, major, minor);
+			else if (cfg_hnd != sm4450_hnd)
+				dev_info(dev,
+					 "%s: DSI rev %x:%x — forcing v2.9 clk reparent ops\n",
+					 __func__, major, minor);
+			cfg_hnd = sm4450_hnd;
+		}
+	} else if (!cfg_hnd &&
+		   of_device_is_compatible(dev->of_node, "qcom,mdss-dsi-ctrl")) {
+		dev_warn(dev, "%s: unknown DSI rev %x:%x, using SM8650 v2.8 cfg\n",
+			 __func__, major, minor);
+		cfg_hnd = msm_dsi_cfg_get(MSM_DSI_VER_MAJOR_6G,
+					  MSM_DSI_6G_VER_MINOR_V2_8_0);
+	}
 
 	DBG("%s: Version %x:%x\n", __func__, major, minor);
 
@@ -386,6 +418,7 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 	DBG("Set clk rates: pclk=%lu, byteclk=%lu",
 	    msm_host->pixel_clk_rate, msm_host->byte_clk_rate);
 
+	pr_emerg("msm_dsi: link_clk opp_set_rate %lu\n", msm_host->byte_clk_rate);
 	ret = dev_pm_opp_set_rate(&msm_host->pdev->dev,
 				  msm_host->byte_clk_rate);
 	if (ret) {
@@ -393,6 +426,8 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 		return ret;
 	}
 
+	pr_emerg("msm_dsi: link_clk pixel_clk set_rate %lu\n",
+		 msm_host->pixel_clk_rate);
 	ret = clk_set_rate(msm_host->pixel_clk, msm_host->pixel_clk_rate);
 	if (ret) {
 		pr_err("%s: Failed to set rate pixel clk, %d\n", __func__, ret);
@@ -400,6 +435,8 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 	}
 
 	if (msm_host->byte_intf_clk) {
+		pr_emerg("msm_dsi: link_clk byte_intf set_rate %lu\n",
+			 msm_host->byte_intf_clk_rate);
 		ret = clk_set_rate(msm_host->byte_intf_clk, msm_host->byte_intf_clk_rate);
 		if (ret) {
 			pr_err("%s: Failed to set rate byte intf clk, %d\n",
@@ -414,21 +451,34 @@ int dsi_link_clk_set_rate_6g(struct msm_dsi_host *msm_host)
 int dsi_link_clk_set_rate_6g_v2_9(struct msm_dsi_host *msm_host)
 {
 	struct device *dev = &msm_host->pdev->dev;
+	unsigned long byte_hz, pixel_hz;
 	int ret;
 
 	/*
-	 * DSI PHY PLLs have to be enabled to allow reparenting to them, so
-	 * cannot use assigned-clock-parents.
+	 * phy_enable() (or ABL) already programmed the PLL in HW. Refresh CCF
+	 * rates via recalc so RCG set_rate sees a non-zero parent. Avoid
+	 * clk_set_rate on the PLL itself (can hang in lock poll).
 	 */
+	byte_hz = clk_get_rate(msm_host->dsi_pll_byte_clk);
+	pixel_hz = clk_get_rate(msm_host->dsi_pll_pixel_clk);
+	pr_emerg("msm_dsi: link_clk PLL ccf byte=%lu pixel=%lu want %lu/%lu\n",
+		 byte_hz, pixel_hz,
+		 msm_host->byte_clk_rate, msm_host->pixel_clk_rate);
+
+	pr_emerg("msm_dsi: link_clk set_parent byte_src\n");
 	ret = clk_set_parent(msm_host->byte_src_clk, msm_host->dsi_pll_byte_clk);
 	if (ret)
 		dev_err(dev, "Failed to parent byte_src -> dsi_pll_byte: %d\n", ret);
 
+	pr_emerg("msm_dsi: link_clk set_parent pixel_src\n");
 	ret = clk_set_parent(msm_host->pixel_src_clk, msm_host->dsi_pll_pixel_clk);
 	if (ret)
 		dev_err(dev, "Failed to parent pixel_src -> dsi_pll_pixel: %d\n", ret);
 
-	return dsi_link_clk_set_rate_6g(msm_host);
+	pr_emerg("msm_dsi: link_clk set_rate_6g (opp/pixel/byte_intf)\n");
+	ret = dsi_link_clk_set_rate_6g(msm_host);
+	pr_emerg("msm_dsi: link_clk set_rate_6g done ret=%d\n", ret);
+	return ret;
 }
 
 int dsi_link_clk_enable_6g(struct msm_dsi_host *msm_host)
@@ -677,6 +727,13 @@ int dsi_calc_clk_rate_6g(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 
 	dsi_calc_pclk(msm_host, is_bonded_dsi);
 	msm_host->esc_clk_rate = clk_get_rate(msm_host->esc_clk);
+	/*
+	 * ESC RCG may still be parented to a 0-rate BYTE PLL left by ABL.
+	 * Force CXO @ 19.2MHz so PHY timing calc and LP cmd work.
+	 */
+	if (!msm_host->esc_clk_rate || msm_host->esc_clk_rate > 20000000)
+		msm_host->esc_clk_rate = 19200000;
+	clk_set_rate(msm_host->esc_clk, msm_host->esc_clk_rate);
 	return 0;
 }
 
@@ -870,9 +927,12 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 	data |= DSI_TRIG_CTRL_MDP_TRIGGER(TRIGGER_NONE);
 	data |= DSI_TRIG_CTRL_DMA_TRIGGER(TRIGGER_SW);
 	data |= DSI_TRIG_CTRL_STREAM(msm_host->channel);
-	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
-		(cfg_hnd->minor >= MSM_DSI_6G_VER_MINOR_V1_2))
-		data |= DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME;
+	/*
+	 * Do not set BLOCK_DMA_WITHIN_FRAME until video timing is owned by
+	 * Linux. With ABL splash / pre_enable-only power_on, the video engine
+	 * may be idle or mid-takeover — blocking DMA on frame boundaries then
+	 * stalls every panel DCS for the full DMA timeout.
+	 */
 	dsi_write(msm_host, REG_DSI_TRIG_CTRL, data);
 
 	data = DSI_CLKOUT_TIMING_CTRL_T_CLK_POST(phy_shared_timings->clk_post) |
@@ -1568,7 +1628,15 @@ static void dsi_err_worker(struct work_struct *work)
 		container_of(work, struct msm_dsi_host, err_work);
 	u32 status = msm_host->err_work_state;
 
-	pr_err_ratelimited("%s: status=%x\n", __func__, status);
+	/*
+	 * status bits: ACK=0 TIMEOUT=1 DLN0=2 FIFO=4 MDP_UFLOW=8
+	 * CONTENTION=0x10 PLL_UNLOCK=0x20. 0x5 = TIMEOUT|FIFO.
+	 */
+	pr_err_ratelimited("%s: status=0x%x fifo=0x%x timeout=0x%x clk=0x%x\n",
+			   __func__, status,
+			   dsi_read(msm_host, REG_DSI_FIFO_STATUS),
+			   dsi_read(msm_host, REG_DSI_TIMEOUT_STATUS),
+			   dsi_read(msm_host, REG_DSI_CLK_STATUS));
 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
 
@@ -2394,6 +2462,8 @@ void msm_dsi_host_get_phy_clk_req(struct mipi_dsi_host *host,
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 	int ret;
 
+	memset(clk_req, 0, sizeof(*clk_req));
+
 	ret = cfg_hnd->ops->calc_clk_rate(msm_host, is_bonded_dsi);
 	if (ret) {
 		pr_err("%s: unable to calc clk rate, %d\n", __func__, ret);
@@ -2409,6 +2479,11 @@ void msm_dsi_host_get_phy_clk_req(struct mipi_dsi_host *host,
 	else
 		clk_req->bitclk_rate = msm_host->byte_clk_rate * 8;
 	clk_req->escclk_rate = msm_host->esc_clk_rate;
+
+	if (!clk_req->bitclk_rate || !clk_req->escclk_rate)
+		pr_err("%s: bad rates bit=%lu esc=%lu byte=%lu mode=%p\n",
+		       __func__, clk_req->bitclk_rate, clk_req->escclk_rate,
+		       msm_host->byte_clk_rate, msm_host->mode);
 }
 
 void msm_dsi_host_enable_irq(struct mipi_dsi_host *host)
@@ -2428,9 +2503,27 @@ void msm_dsi_host_disable_irq(struct mipi_dsi_host *host)
 int msm_dsi_host_enable(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+	u32 data;
+
+	/* ABL already left video mode running — do not rewrite DSI_CTRL. */
+	if (rg55g1_preserve_abl_display) {
+		pr_emerg("msm_dsi: host_enable skip (ABL video already on)\n");
+		msm_host->enabled = true;
+		return 0;
+	}
 
 	dsi_op_mode_config(msm_host,
 		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), true);
+
+	/* Safe to block DMA on frame once video mode is running. */
+	if ((cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) &&
+	    (cfg_hnd->minor >= MSM_DSI_6G_VER_MINOR_V1_2) &&
+	    (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO)) {
+		data = dsi_read(msm_host, REG_DSI_TRIG_CTRL);
+		data |= DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME;
+		dsi_write(msm_host, REG_DSI_TRIG_CTRL, data);
+	}
 
 	/* TODO: clock should be turned off for command mode,
 	 * and only turned on before MDP START.
@@ -2491,8 +2584,27 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	}
 
 	msm_host->byte_intf_clk_rate = msm_host->byte_clk_rate;
-	if (phy_shared_timings->byte_intf_clk_div_2)
+	if (phy_shared_timings && phy_shared_timings->byte_intf_clk_div_2)
 		msm_host->byte_intf_clk_rate /= 2;
+
+	/*
+	 * ABL continuous splash: PHY/DSI already running. Do not reset the
+	 * controller, reprogram timings, or clk_set_rate the PHY PLL — those
+	 * MMIO paths hang the bus when ABL still owns the scanout pipeline.
+	 */
+	if (rg55g1_preserve_abl_display) {
+		pr_emerg("msm_dsi: host power_on ABL keep-alive (no link clk)\n");
+		/*
+		 * Only take bus clocks via RPM. Do not prepare_enable BYTE/PCLK:
+		 * Linux still sees TCXO parents; enabling would reprogram RCGs
+		 * and kill ABL's PLL-sourced link (and can hang CMD_UPDATE).
+		 */
+		pm_runtime_get_sync(&msm_host->pdev->dev);
+		msm_host->power_on = true;
+		pr_emerg("msm_dsi: host power_on ABL done\n");
+		mutex_unlock(&msm_host->dev_mutex);
+		return 0;
+	}
 
 	msm_dsi_sfpb_config(msm_host, true);
 
@@ -2505,9 +2617,34 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	}
 
 	pm_runtime_get_sync(&msm_host->pdev->dev);
-	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
-	if (!ret)
+	pr_emerg("msm_dsi: host link_clk_set_rate\n");
+	/*
+	 * Keep ABL PHY PLL untouched: clk_set_rate on BYTE/PCLK has
+	 * CLK_SET_RATE_PARENT and can reprogram the PLL (hang / FIFO).
+	 * Only reparent so CCF matches HW, then enable branch clocks.
+	 * Always reprogram DSI host timing below so DPU INTF matches.
+	 */
+	if (rg55g1_abl_panel_ready &&
+	    msm_host->byte_src_clk && msm_host->dsi_pll_byte_clk) {
+		int pret;
+
+		pret = clk_set_parent(msm_host->byte_src_clk,
+				      msm_host->dsi_pll_byte_clk);
+		pr_emerg("msm_dsi: abl reparent byte_src ret=%d\n", pret);
+		if (msm_host->pixel_src_clk && msm_host->dsi_pll_pixel_clk) {
+			pret = clk_set_parent(msm_host->pixel_src_clk,
+					     msm_host->dsi_pll_pixel_clk);
+			pr_emerg("msm_dsi: abl reparent pixel_src ret=%d\n", pret);
+		}
+		pr_emerg("msm_dsi: host link_clk enable only (ABL PLL keep)\n");
 		ret = cfg_hnd->ops->link_clk_enable(msm_host);
+	} else {
+		ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
+		if (!ret) {
+			pr_emerg("msm_dsi: host link_clk_enable\n");
+			ret = cfg_hnd->ops->link_clk_enable(msm_host);
+		}
+	}
 	if (ret) {
 		pr_err("%s: failed to enable link clocks. ret=%d\n",
 		       __func__, ret);
@@ -2521,6 +2658,13 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		goto fail_disable_clk;
 	}
 
+	/*
+	 * Keep ABL PHY+panel, but reprogram the DSI host to match Linux
+	 * mode / DPU INTF. Skipping this after quiesce left ABL host timing
+	 * fighting the new INTF (white + horizontal noise).
+	 */
+	pr_emerg("msm_dsi: host timing/sw_reset/ctrl_enable%s\n",
+		 rg55g1_abl_panel_ready ? " (ABL PHY keep)" : "");
 	dsi_timing_setup(msm_host, is_bonded_dsi);
 	dsi_sw_reset(msm_host);
 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
@@ -2549,6 +2693,13 @@ int msm_dsi_host_power_off(struct mipi_dsi_host *host)
 	mutex_lock(&msm_host->dev_mutex);
 	if (!msm_host->power_on) {
 		DBG("dsi host already off");
+		goto unlock_ret;
+	}
+
+	/* Do not tear down ABL-owned DSI hardware during bring-up. */
+	if (rg55g1_preserve_abl_display) {
+		pm_runtime_put(&msm_host->pdev->dev);
+		msm_host->power_on = false;
 		goto unlock_ret;
 	}
 

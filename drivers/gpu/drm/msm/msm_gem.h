@@ -23,6 +23,7 @@
 /* Additional internal-use only BO flags: */
 #define MSM_BO_STOLEN        0x10000000    /* try to use stolen/splash memory */
 #define MSM_BO_MAP_PRIV      0x20000000    /* use IOMMU_PRIV when mapping */
+#define MSM_BO_CONTIG        0x40000000    /* compound contiguous pages (identity MMU) */
 
 /**
  * struct msm_gem_vm_log_entry - An entry in the VM log

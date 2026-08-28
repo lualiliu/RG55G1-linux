@@ -30,6 +30,14 @@
 #define to_dpu_encoder_phys_vid(x) \
 	container_of(x, struct dpu_encoder_phys_vid, base)
 
+/* RG55G1 ABL continuous splash — avoid reprogramming live INTF/DSI. */
+extern bool rg55g1_preserve_abl_display;
+
+static inline bool dpu_rg55g1_abl_keepalive(void)
+{
+	return rg55g1_preserve_abl_display;
+}
+
 static bool dpu_encoder_phys_vid_is_master(
 		struct dpu_encoder_phys *phys_enc)
 {
@@ -449,6 +457,7 @@ static void dpu_encoder_phys_vid_enable(struct dpu_encoder_phys *phys_enc)
 	const struct msm_format *fmt;
 	u32 fmt_fourcc;
 	u32 mode_3d;
+	struct dpu_hw_intf_status intf_status = { 0 };
 
 	ctl = phys_enc->hw_ctl;
 	fmt_fourcc = dpu_encoder_get_drm_fmt(phys_enc);
@@ -459,6 +468,22 @@ static void dpu_encoder_phys_vid_enable(struct dpu_encoder_phys *phys_enc)
 
 	if (WARN_ON(!phys_enc->hw_intf->ops.enable_timing))
 		return;
+
+	/*
+	 * ABL continuous splash: INTF timing is already running. Reprogramming
+	 * setup_timing_gen / flushing INTF leaves CTL_FLUSH BIT(31) stuck
+	 * ("vblank timeout: 8002xxxx"). Keep the live timing engine.
+	 */
+	if (dpu_rg55g1_abl_keepalive() &&
+	    phys_enc->hw_intf->ops.get_status) {
+		phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf, &intf_status);
+		if (intf_status.is_en) {
+			pr_emerg("dpu: vid_enable ABL keep INTF timing (skip reconfig)\n");
+			atomic_set(&phys_enc->underrun_cnt, 0);
+			phys_enc->enable_state = DPU_ENC_ENABLED;
+			return;
+		}
+	}
 
 	dpu_encoder_helper_split_config(phys_enc, phys_enc->hw_intf->idx);
 
@@ -534,6 +559,7 @@ static int dpu_encoder_phys_vid_wait_for_commit_done(
 {
 	struct dpu_hw_ctl *hw_ctl = phys_enc->hw_ctl;
 	int ret;
+	u32 flush;
 
 	if (!hw_ctl)
 		return 0;
@@ -542,7 +568,17 @@ static int dpu_encoder_phys_vid_wait_for_commit_done(
 		(hw_ctl->ops.get_flush_register(hw_ctl) == 0),
 		msecs_to_jiffies(50));
 	if (ret <= 0) {
-		DPU_ERROR("vblank timeout: %x\n", hw_ctl->ops.get_flush_register(hw_ctl));
+		flush = hw_ctl->ops.get_flush_register(hw_ctl);
+		DPU_ERROR("vblank timeout: %x\n", flush);
+		/*
+		 * During ABL continuous-splash takeover the flush register may
+		 * not clear (wrong CTL ownership / skipped INTF rebind). Do not
+		 * fail the commit — allow fbdev/KMS to finish bring-up.
+		 */
+		if (dpu_rg55g1_abl_keepalive()) {
+			pr_emerg("dpu: ABL ignore flush timeout %x\n", flush);
+			return 0;
+		}
 		return -ETIMEDOUT;
 	}
 

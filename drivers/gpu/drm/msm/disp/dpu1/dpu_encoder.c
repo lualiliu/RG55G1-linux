@@ -23,6 +23,9 @@
 #include "dpu_hwio.h"
 #include "dpu_hw_catalog.h"
 #include "dpu_hw_intf.h"
+
+/* RG55G1 ABL continuous splash */
+extern bool rg55g1_preserve_abl_display;
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_cwb.h"
 #include "dpu_hw_dspp.h"
@@ -2730,8 +2733,14 @@ static void dpu_encoder_frame_done_timeout(struct timer_list *t)
 
 	DPU_ERROR_ENC_RATELIMITED(dpu_enc, "frame done timeout\n");
 
-	if (atomic_inc_return(&dpu_enc->frame_done_timeout_cnt) == 1)
-		msm_disp_snapshot_state(drm_enc->dev);
+	/* Avoid massive MMIO dump while ABL display path is wedged. */
+	if (!rg55g1_preserve_abl_display) {
+		if (atomic_inc_return(&dpu_enc->frame_done_timeout_cnt) == 1)
+			msm_disp_snapshot_state(drm_enc->dev);
+	} else {
+		atomic_inc(&dpu_enc->frame_done_timeout_cnt);
+		pr_emerg("dpu: ABL skip disp snapshot on frame_done timeout\n");
+	}
 
 	event = DPU_ENCODER_FRAME_EVENT_ERROR;
 	trace_dpu_enc_frame_done_timeout(DRMID(drm_enc), event);

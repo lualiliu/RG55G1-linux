@@ -887,7 +887,19 @@ static struct usb_serial_driver * const serial_drivers[] = {
 	&ch341_device, NULL
 };
 
-module_usb_serial_driver(serial_drivers, id_table);
+/* RG55G1 skips LV6 device_initcall; rg55g1_usb_serial_bringup() calls this. */
+int __init ch341_init(void)
+{
+	return usb_serial_register_drivers(serial_drivers, KBUILD_MODNAME, id_table);
+}
+
+static void __exit ch341_exit(void)
+{
+	usb_serial_deregister_drivers(serial_drivers);
+}
+
+module_init(ch341_init);
+module_exit(ch341_exit);
 
 MODULE_DESCRIPTION("Winchiphead CH341 USB Serial driver");
 MODULE_LICENSE("GPL v2");

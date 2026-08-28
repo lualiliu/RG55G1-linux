@@ -380,6 +380,13 @@ static const struct dpu_lm_sub_blks sc7180_lm_sblk = {
 	},
 };
 
+static const struct dpu_lm_sub_blks sm4450_lm_sblk = {
+	.maxblendstages = 5, /* excluding base layer */
+	.blendstage_base = { /* offsets relative to mixer base */
+		0x20, 0x38, 0x50, 0x68, 0x80
+	},
+};
+
 static const struct dpu_lm_sub_blks sm8750_lm_sblk = {
 	.maxblendstages = 11, /* excluding base layer */
 	.blendstage_base = { /* offsets relative to mixer base */
@@ -775,6 +782,7 @@ static const struct dpu_qos_lut_entry sc7180_qos_nrt[] = {
 #include "catalog/dpu_8_0_sc8280xp.h"
 #include "catalog/dpu_8_1_sm8450.h"
 #include "catalog/dpu_8_4_sa8775p.h"
+#include "catalog/dpu_8_6_sm4450.h"
 
 #include "catalog/dpu_9_0_sm8550.h"
 #include "catalog/dpu_9_1_sar2130p.h"

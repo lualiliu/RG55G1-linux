@@ -394,6 +394,14 @@ int dpu_core_perf_crtc_update(struct drm_crtc *crtc,
 
 		trace_dpu_core_perf_update_clk(kms->dev, !crtc->enabled, clk_rate);
 
+		/*
+		 * Rate 0 propagates to DISP_CC_PLL0 as a bogus VCO request
+		 * ("Rounded rate 0 not within range [249600000, …)"). Keep a
+		 * floor while display hardware stays powered.
+		 */
+		if (!clk_rate)
+			clk_rate = 200000000;
+
 		clk_rate = min(clk_rate, kms->perf.max_core_clk_rate);
 		ret = dev_pm_opp_set_rate(&kms->pdev->dev, clk_rate);
 		if (ret) {

@@ -801,3 +801,51 @@ struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsig
 
 	return mmu;
 }
+
+/*
+ * RG55G1: apps-smmu stays in firmware/bypass mode (arm-smmu not bound).
+ * MDSS SIDs use phys DMA; program scanout addresses as PA (IOVA == PA).
+ */
+static void msm_identity_detach(struct msm_mmu *mmu)
+{
+}
+
+static int msm_identity_map(struct msm_mmu *mmu, uint64_t iova,
+			    struct sg_table *sgt, size_t off, size_t len,
+			    int prot)
+{
+	/*
+	 * No SMMU page tables: caller already pinned IOVA == contiguous PA.
+	 * Do not compare sg_dma_address — bounce buffers would false-fail.
+	 */
+	return 0;
+}
+
+static int msm_identity_unmap(struct msm_mmu *mmu, uint64_t iova, size_t len)
+{
+	return 0;
+}
+
+static void msm_identity_destroy(struct msm_mmu *mmu)
+{
+	kfree(mmu);
+}
+
+static const struct msm_mmu_funcs identity_funcs = {
+	.detach = msm_identity_detach,
+	.map = msm_identity_map,
+	.unmap = msm_identity_unmap,
+	.destroy = msm_identity_destroy,
+};
+
+struct msm_mmu *msm_identity_mmu_new(struct device *dev)
+{
+	struct msm_mmu *mmu;
+
+	mmu = kzalloc(sizeof(*mmu), GFP_KERNEL);
+	if (!mmu)
+		return ERR_PTR(-ENOMEM);
+
+	msm_mmu_init(mmu, dev, &identity_funcs, MSM_MMU_IDENTITY);
+	return mmu;
+}

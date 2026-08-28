@@ -54,6 +54,10 @@ static bool modeset = true;
 MODULE_PARM_DESC(modeset, "Use kernel modesetting [KMS] (1=on (default), 0=disable)");
 module_param(modeset, bool, 0600);
 
+static bool msm_drm_registered;
+
+int rg55g1_msm_kms_register(void);
+
 static bool separate_gpu_kms;
 MODULE_PARM_DESC(separate_gpu_drm, "Use separate DRM device for the GPU (0=single DRM device for both GPU and display (default), 1=two DRM devices)");
 module_param(separate_gpu_kms, bool, 0400);
@@ -1121,8 +1125,11 @@ void msm_gpu_remove(struct platform_device *pdev,
 	msm_drm_uninit(&pdev->dev, ops);
 }
 
-static int __init msm_drm_register(void)
+static int msm_drm_register(void)
 {
+	if (msm_drm_registered)
+		return 0;
+
 	if (!modeset)
 		return -EINVAL;
 
@@ -1136,7 +1143,13 @@ static int __init msm_drm_register(void)
 	msm_mdp4_register();
 	msm_mdss_register();
 
+	msm_drm_registered = true;
 	return 0;
+}
+
+int rg55g1_msm_kms_register(void)
+{
+	return msm_drm_register();
 }
 
 static void __exit msm_drm_unregister(void)

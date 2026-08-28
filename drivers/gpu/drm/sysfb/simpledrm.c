@@ -900,7 +900,16 @@ static struct platform_driver simpledrm_platform_driver = {
 	.remove = simpledrm_remove,
 };
 
+#ifndef MODULE
+static int __init simpledrm_driver_init(void)
+{
+	return platform_driver_register(&simpledrm_platform_driver);
+}
+
+subsys_initcall_sync(simpledrm_driver_init);
+#else
 module_platform_driver(simpledrm_platform_driver);
+#endif
 
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL v2");

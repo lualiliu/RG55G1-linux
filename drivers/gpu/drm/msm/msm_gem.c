@@ -5,6 +5,7 @@
  */
 
 #include <linux/dma-map-ops.h>
+#include <linux/mm.h>
 #include <linux/vmalloc.h>
 #include <linux/spinlock.h>
 #include <linux/shmem_fs.h>
@@ -192,15 +193,51 @@ static struct page **get_pages(struct drm_gem_object *obj)
 
 	if (!msm_obj->pages) {
 		struct drm_device *dev = obj->dev;
+		struct msm_drm_private *priv = dev->dev_private;
 		struct page **p;
 		size_t npages = obj->size >> PAGE_SHIFT;
+		bool identity = priv->kms && priv->kms->vm &&
+			to_msm_vm(priv->kms->vm)->mmu &&
+			to_msm_vm(priv->kms->vm)->mmu->type == MSM_MMU_IDENTITY;
 
-		p = drm_gem_get_pages(obj);
+		/*
+		 * Identity MMU needs a contiguous PA block for every BO that
+		 * will be pinned (scanout, DSI TX, cursors, …). Prefer CMA
+		 * — high-order buddy alloc (~8MiB fbdev) routinely fails.
+		 */
+		if (identity) {
+			struct page *page;
+			unsigned int order = get_order(obj->size);
+			unsigned int i;
+			gfp_t gfp = GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN;
 
-		if (IS_ERR(p)) {
-			DRM_DEV_ERROR(dev->dev, "could not get pages: %ld\n",
-					PTR_ERR(p));
-			return p;
+			page = dma_alloc_contiguous(dev->dev, obj->size, gfp);
+			if (!page)
+				page = alloc_pages(gfp | __GFP_COMP |
+						   __GFP_NORETRY, order);
+			if (!page) {
+				DRM_DEV_ERROR(dev->dev,
+					      "contiguous identity alloc failed (%zu)\n",
+					      obj->size);
+				return ERR_PTR(-ENOMEM);
+			}
+
+			p = kvmalloc_array(npages, sizeof(*p), GFP_KERNEL);
+			if (!p) {
+				dma_free_contiguous(dev->dev, page, obj->size);
+				return ERR_PTR(-ENOMEM);
+			}
+			for (i = 0; i < npages; i++)
+				p[i] = pfn_to_page(page_to_pfn(page) + i);
+			msm_obj->flags |= MSM_BO_CONTIG;
+		} else {
+			p = drm_gem_get_pages(obj);
+
+			if (IS_ERR(p)) {
+				DRM_DEV_ERROR(dev->dev, "could not get pages: %ld\n",
+						PTR_ERR(p));
+				return p;
+			}
 		}
 
 		update_device_mem(dev->dev_private, obj->size);
@@ -255,7 +292,14 @@ static void put_pages(struct drm_gem_object *obj)
 
 		update_device_mem(obj->dev->dev_private, -obj->size);
 
-		drm_gem_put_pages(obj, msm_obj->pages, true, false);
+		if (msm_obj->flags & MSM_BO_CONTIG) {
+			dma_free_contiguous(obj->dev->dev, msm_obj->pages[0],
+					    obj->size);
+			kvfree(msm_obj->pages);
+			msm_obj->flags &= ~MSM_BO_CONTIG;
+		} else {
+			drm_gem_put_pages(obj, msm_obj->pages, true, false);
+		}
 
 		msm_obj->pages = NULL;
 		update_lru(obj);
@@ -528,12 +572,46 @@ static int get_and_pin_iova_range_locked(struct drm_gem_object *obj,
 					 u64 range_start, u64 range_end)
 {
 	struct drm_gpuva *vma;
+	struct msm_gem_vm *msm_vm = to_msm_vm(vm);
 	int ret;
 
 	msm_gem_assert_locked(obj);
 
 	if (to_msm_bo(obj)->flags & MSM_BO_NO_SHARE)
 		return -EINVAL;
+
+	/*
+	 * Identity MMU (SMMU bypass): allocate IOVA == contiguous DMA address
+	 * so MDSS programs physical scanout addresses.
+	 */
+	if (msm_vm->mmu && msm_vm->mmu->type == MSM_MMU_IDENTITY) {
+		struct page **pages;
+		dma_addr_t phys;
+		size_t npages;
+		size_t i;
+
+		pages = msm_gem_get_pages_locked(obj, MSM_MADV_WILLNEED);
+		if (IS_ERR(pages))
+			return PTR_ERR(pages);
+
+		npages = obj->size >> PAGE_SHIFT;
+		phys = page_to_phys(pages[0]);
+		for (i = 1; i < npages; i++) {
+			if (page_to_phys(pages[i]) !=
+			    phys + ((dma_addr_t)i << PAGE_SHIFT)) {
+				DRM_DEV_ERROR(obj->dev->dev,
+					      "identity MMU needs contiguous BO\n");
+				return -EINVAL;
+			}
+		}
+
+		/*
+		 * Always pin at PA. Do not use sg_dma_address — bounce buffers
+		 * would break IOVA==PA for MDSS/DSI.
+		 */
+		range_start = phys;
+		range_end = phys + obj->size;
+	}
 
 	vma = get_vma_locked(obj, vm, range_start, range_end);
 	if (IS_ERR(vma))

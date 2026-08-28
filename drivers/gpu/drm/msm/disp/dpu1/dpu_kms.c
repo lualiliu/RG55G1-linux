@@ -402,7 +402,13 @@ static const struct drm_private_state_funcs dpu_kms_global_state_funcs = {
 
 static void dpu_kms_global_obj_fini(struct dpu_kms *dpu_kms)
 {
+	/* Idempotent: hw_init error path and kms destroy both call this. */
+	if (!dpu_kms->global_state.funcs)
+		return;
+
 	drm_atomic_private_obj_fini(&dpu_kms->global_state);
+	dpu_kms->global_state.funcs = NULL;
+	dpu_kms->global_state.state = NULL;
 }
 
 static int dpu_kms_parse_data_bus_icc_path(struct dpu_kms *dpu_kms)
@@ -414,8 +420,15 @@ static int dpu_kms_parse_data_bus_icc_path(struct dpu_kms *dpu_kms)
 	path0 = msm_icc_get(dpu_dev, "mdp0-mem");
 	path1 = msm_icc_get(dpu_dev, "mdp1-mem");
 
-	if (IS_ERR_OR_NULL(path0))
-		return PTR_ERR_OR_ZERO(path0);
+	if (IS_ERR(path0)) {
+		if (PTR_ERR(path0) != -EPROBE_DEFER)
+			dev_warn(dpu_dev, "mdp0-mem icc unavailable (%ld), skipping\n",
+				 PTR_ERR(path0));
+		return PTR_ERR(path0) == -EPROBE_DEFER ? -EPROBE_DEFER : 0;
+	}
+
+	if (!path0)
+		return 0;
 
 	dpu_kms->path[0] = path0;
 	dpu_kms->num_paths = 1;
@@ -1154,8 +1167,10 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	dev->mode_config.cursor_width = 512;
 	dev->mode_config.cursor_height = 512;
 
-	drm_atomic_private_obj_init(dpu_kms->dev, &dpu_kms->global_state,
-				    &dpu_kms_global_state_funcs);
+	rc = drm_atomic_private_obj_init(dpu_kms->dev, &dpu_kms->global_state,
+					 &dpu_kms_global_state_funcs);
+	if (rc)
+		return rc;
 
 	atomic_set(&dpu_kms->bandwidth_ref, 0);
 
@@ -1302,10 +1317,20 @@ static int dpu_kms_init(struct drm_device *ddev)
 	unsigned long max_freq = ULONG_MAX;
 
 	opp = dev_pm_opp_find_freq_floor(dev, &max_freq);
-	if (!IS_ERR(opp))
+	if (!IS_ERR(opp)) {
 		dev_pm_opp_put(opp);
+		dev_pm_opp_set_rate(dev, max_freq);
+	} else {
+		/*
+		 * No OPP table: do not pass ULONG_MAX into set_rate (propagates
+		 * to DISP_CC_PLL0 as a bogus request). Use catalog default.
+		 */
+		unsigned long rate = dpu_kms_get_clk_rate(dpu_kms, "core");
 
-	dev_pm_opp_set_rate(dev, max_freq);
+		if (!rate)
+			rate = 200000000;
+		dev_pm_opp_set_rate(dev, rate);
+	}
 
 	ret = msm_kms_init(&dpu_kms->base, &kms_funcs);
 	if (ret) {
@@ -1511,6 +1536,8 @@ static const struct of_device_id dpu_dt_match[] = {
 	{ .compatible = "qcom,sm8350-dpu", .data = &dpu_sm8350_cfg, },
 	{ .compatible = "qcom,sm8450-dpu", .data = &dpu_sm8450_cfg, },
 	{ .compatible = "qcom,sm8550-dpu", .data = &dpu_sm8550_cfg, },
+	{ .compatible = "qcom,sm4450-dpu", .data = &dpu_sm4450_cfg, },
+	{ .compatible = "qcom,ravelin-dpu", .data = &dpu_sm4450_cfg, },
 	{ .compatible = "qcom,sm8650-dpu", .data = &dpu_sm8650_cfg, },
 	{ .compatible = "qcom,sm8750-dpu", .data = &dpu_sm8750_cfg, },
 	{ .compatible = "qcom,x1e80100-dpu", .data = &dpu_x1e80100_cfg, },

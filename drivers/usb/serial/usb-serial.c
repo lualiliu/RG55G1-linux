@@ -77,6 +77,7 @@ exit:
 	mutex_unlock(&table_lock);
 	return port;
 }
+EXPORT_SYMBOL_GPL(usb_serial_port_get_by_minor);
 
 static int allocate_minors(struct usb_serial *serial, int num_ports)
 {
@@ -189,6 +190,7 @@ void usb_serial_put(struct usb_serial *serial)
 {
 	kref_put(&serial->kref, destroy_serial);
 }
+EXPORT_SYMBOL_GPL(usb_serial_put);
 
 /*****************************************************************************
  * Driver tty interface functions
@@ -1308,7 +1310,8 @@ static const struct tty_operations serial_ops = {
 
 struct tty_driver *usb_serial_tty_driver;
 
-static int __init usb_serial_init(void)
+/* RG55G1 skips LV6 device_initcall; rg55g1_usb_serial_bringup() calls this. */
+int __init usb_serial_init(void)
 {
 	int result;
 

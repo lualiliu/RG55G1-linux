@@ -31,9 +31,23 @@
 #include <soc/qcom/cmd-db.h>
 #include <soc/qcom/rpmh.h>
 #include <soc/qcom/tcs.h>
+#include "rg55g1_bringup.h"
+#include "rg55g1_splash.h"
 
 bool rg55g1_skip_of_populate = true;
 EXPORT_SYMBOL_GPL(rg55g1_skip_of_populate);
+
+bool rg55g1_msm_early;
+bool rg55g1_msm_auto;
+bool rg55g1_preserve_abl_display = true;
+EXPORT_SYMBOL_GPL(rg55g1_preserve_abl_display);
+
+bool rg55g1_abl_panel_ready = true;
+EXPORT_SYMBOL_GPL(rg55g1_abl_panel_ready);
+bool rg55g1_skip_mdss_reset;
+bool rg55g1_skip_mdss_populate;
+EXPORT_SYMBOL_GPL(rg55g1_skip_mdss_reset);
+EXPORT_SYMBOL_GPL(rg55g1_skip_mdss_populate);
 
 /* When set, PHY may proceed without PMIC regulators (bootloader left USB up). */
 bool rg55g1_usb_loose_supplies = true;
@@ -44,9 +58,6 @@ bool rg55g1_usb_host_port_connected;
 EXPORT_SYMBOL_GPL(rg55g1_usb_host_port_connected);
 
 extern bool rg55g1_block_deferred;
-extern void rg55g1_status(const char *msg, u32 color);
-extern void rg55g1_status_vbus(const char *msg, u32 color);
-extern void rg55g1_status_batt(const char *msg, u32 color);
 extern void driver_deferred_probe_trigger(void);
 
 static void rg55g1_force_status(struct device_node *np, const char *status)
@@ -80,10 +91,54 @@ static void rg55g1_force_disabled_node(struct device_node *np)
 	rg55g1_force_status(np, "disabled");
 }
 
+void rg55g1_force_node_okay(struct device_node *np)
+{
+	if (!np)
+		return;
+	rg55g1_force_status(np, "okay");
+}
+EXPORT_SYMBOL_GPL(rg55g1_force_node_okay);
+
+void rg55g1_force_node_disabled(struct device_node *np)
+{
+	rg55g1_force_disabled_node(np);
+}
+EXPORT_SYMBOL_GPL(rg55g1_force_node_disabled);
+
 static bool rg55g1_is_sdhci(struct device_node *np)
 {
 	return of_device_is_compatible(np, "qcom,sdhci-msm-v5") ||
 	       of_device_is_compatible(np, "qcom,sdhci-msm-v4");
+}
+
+static bool rg55g1_is_display_node(struct device_node *np)
+{
+	return of_device_is_compatible(np, "qcom,ravelin-dispcc") ||
+	       of_device_is_compatible(np, "qcom,sm4450-dispcc") ||
+	       of_device_is_compatible(np, "qcom,ravelin-mdss") ||
+	       of_device_is_compatible(np, "qcom,sm4450-mdss") ||
+	       of_device_is_compatible(np, "qcom,mdss") ||
+	       of_device_is_compatible(np, "qcom,sm4450-dpu") ||
+	       of_device_is_compatible(np, "qcom,ravelin-dpu") ||
+	       of_device_is_compatible(np, "qcom,sm4450-dsi-ctrl") ||
+	       of_device_is_compatible(np, "qcom,mdss-dsi-ctrl") ||
+	       of_device_is_compatible(np, "qcom,sm4450-dsi-phy-4nm") ||
+	       of_device_is_compatible(np, "qcom,ravelin-dsi-phy-4nm") ||
+	       of_device_is_compatible(np, "focaltech,ft7131m");
+}
+
+static bool rg55g1_is_smem_keep(struct device_node *np)
+{
+	return of_device_is_compatible(np, "qcom,smem") ||
+	       of_device_is_compatible(np, "qcom,tcsr-mutex");
+}
+
+static bool rg55g1_is_smmu_node(struct device_node *np)
+{
+	return of_device_is_compatible(np, "qcom,qsmmu-v500") ||
+	       of_device_is_compatible(np, "qcom,smmu-500") ||
+	       of_device_is_compatible(np, "arm,mmu-500") ||
+	       of_device_is_compatible(np, "qcom,adreno-smmu");
 }
 
 static bool rg55g1_is_usb_keep(struct device_node *np)
@@ -99,10 +154,14 @@ static bool rg55g1_is_usb_keep(struct device_node *np)
 	       of_device_is_compatible(np, "qcom,usb-snps-femto-v2-phy") ||
 	       of_device_is_compatible(np, "qcom,spmi-pmic-arb") ||
 	       of_device_is_compatible(np, "qcom,spmi-pmic-arb-debug") ||
-	       of_device_is_compatible(np, "qcom,qsmmu-v500") ||
-	       of_device_is_compatible(np, "qcom,smmu-500") ||
-	       of_device_is_compatible(np, "arm,mmu-500") ||
-	       rg55g1_is_sdhci(np);
+	       /*
+		* Keep SMMU nodes out of sanitize-disable, but do NOT create
+		* platform devices for them in USB bringup (see populate loop).
+		*/
+	       rg55g1_is_smmu_node(np) ||
+	       rg55g1_is_sdhci(np) ||
+	       rg55g1_is_smem_keep(np) ||
+	       rg55g1_is_display_node(np);
 }
 
 static int rg55g1_disable_children(const char *path)
@@ -375,7 +434,7 @@ int rg55g1_sanitize_dt(void)
 		of_node_put(rm);
 	}
 
-	pr_emerg("rg55g1: DT sanitize disabled %d nodes (kept USB/GCC/SDHCI)\n", n);
+	pr_emerg("rg55g1: DT sanitize disabled %d nodes (kept USB/GCC/SDHCI/display)\n", n);
 	return n;
 }
 EXPORT_SYMBOL_GPL(rg55g1_sanitize_dt);
@@ -2210,7 +2269,7 @@ static int rg55g1_bringup_apps_smmu(void)
 	want_s2cr = FIELD_PREP(GENMASK(17, 16), 0) |
 		    FIELD_PREP(GENMASK(7, 0), cbndx);
 
-	/* MMC first (lower SMR slots), then USB. */
+	/* MMC first (lower SMR slots), then USB, then display SID. */
 	ret = rg55g1_smmu_install_exact(smmu, numsmr, 0x140, want_s2cr, "SD");
 	if (ret < 0)
 		pr_emerg("rg55g1: SD SID install failed %d\n", ret);
@@ -2223,6 +2282,37 @@ static int rg55g1_bringup_apps_smmu(void)
 		rg55g1_status("SMMU-SMR!", 0x00ff8000);
 		iounmap(smmu);
 		return ret;
+	}
+	/*
+	 * Do not rewrite MDSS SID 0x800 if ABL already programmed it — touching
+	 * a live display SMR can hang the bus. Only install when unmatched.
+	 */
+	{
+		bool mdss_present = false;
+		unsigned int i;
+
+		for (i = 0; i < numsmr; i++) {
+			u32 smr = readl_relaxed(smmu + 0x800 + (i << 2));
+			u32 id, mask;
+
+			if (!(smr & BIT(31)))
+				continue;
+			id = smr & 0xffff;
+			mask = (smr >> 16) & 0x7fff;
+			if ((0x800 & ~mask) == (id & ~mask)) {
+				mdss_present = true;
+				break;
+			}
+		}
+		if (mdss_present)
+			pr_emerg("rg55g1: MDSS SID already programmed — leave alone\n");
+		else {
+			ret = rg55g1_smmu_install_exact(smmu, numsmr, 0x800,
+							want_s2cr, "MDSS");
+			if (ret < 0)
+				pr_emerg("rg55g1: MDSS SID install failed %d\n",
+					 ret);
+		}
 	}
 
 	pr_emerg("rg55g1: SMMU bypass cb=%u sCR0=0x%x\n", cbndx, scr0);
@@ -2669,6 +2759,12 @@ int rg55g1_bringup_usb(void)
 		rg55g1_set_u32_prop(hsphy, "#phy-cells", 0);
 
 	/*
+	 * LV6 device_initcall is skipped on RG55G1; register usb-serial/ch341
+	 * before xhci enumerates the CH340 on OTG.
+	 */
+	(void)rg55g1_usb_serial_bringup();
+
+	/*
 	 * Pass 0: HS PHY first so dwc3 can resolve phys.
 	 * Pass 1: DWC3 glue.
 	 */
@@ -2688,6 +2784,10 @@ int rg55g1_bringup_usb(void)
 				continue;
 			if (is_gcc)
 				continue; /* already created */
+			if (rg55g1_is_smmu_node(child))
+				continue; /* MMIO bypass only; never bind arm-smmu */
+			if (rg55g1_is_display_node(child))
+				continue; /* MSM display path owns these */
 			if (rg55g1_is_sdhci(child))
 				continue; /* created in rg55g1_bringup_mmc() */
 			if (pass == 0 && is_dwc)
@@ -2738,6 +2838,9 @@ int rg55g1_bringup_usb(void)
 	driver_deferred_probe_trigger();
 	msleep(200);
 
+	/* CH340 should bind right after deferred unblock; start log relay early. */
+	rg55g1_log_export_start();
+
 	/* Refresh dual-role after USB clocks/host are up. */
 	rg55g1_status("USB-VBUS", 0x00ffff00);
 	(void)rg55g1_enable_pm7250b_vbus();
@@ -2762,6 +2865,25 @@ int rg55g1_bringup_usb(void)
 	/* Gamepad after GCC clocks are available for GENI SPI. */
 	n += rg55g1_bringup_joypad();
 
+#if IS_ENABLED(CONFIG_DRM_MSM_MDSS)
+	/*
+	 * Run MSM here (~4–5s, before exec /init) so early dmesg captures
+	 * include DISPCC/MDSS lines. Requires rg55g1.msm=1 on cmdline.
+	 */
+	if (rg55g1_msm_auto) {
+		int dret = rg55g1_msm_display_retry();
+
+		if (!dret)
+			pr_emerg("rg55g1: MSM display ready (USB bringup)\n");
+		else if (dret != -ENODEV)
+			pr_emerg("rg55g1: MSM display retry: %d (boot continues)\n",
+				 dret);
+	}
+#endif
+
+	/* Full ringbuffer dump after MSM/MMC/keys (~20s), not at ~2.5s. */
+	rg55g1_log_export_flush();
+
 	rg55g1_status(n ? "USB-DEV" : "USB-NONE", n ? 0x0000ff00 : 0x00ff0000);
 	pr_emerg("rg55g1: USB bringup done: %d platform devs (see top VBUS line)\n",
 		 n);
@@ -2780,6 +2902,20 @@ int rg55g1_vbus_refresh(void)
 	return rg55g1_enable_pm7250b_vbus();
 }
 EXPORT_SYMBOL_GPL(rg55g1_vbus_refresh);
+
+static int __init rg55g1_msm_early_setup(char *str)
+{
+	rg55g1_msm_early = true;
+	return 0;
+}
+early_param("rg55g1.msm_early", rg55g1_msm_early_setup);
+
+static int __init rg55g1_msm_auto_setup(char *str)
+{
+	rg55g1_msm_auto = true;
+	return 0;
+}
+early_param("rg55g1.msm", rg55g1_msm_auto_setup);
 
 static int __init rg55g1_bringup_early_flags(void)
 {

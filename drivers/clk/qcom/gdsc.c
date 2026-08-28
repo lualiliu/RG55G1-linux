@@ -18,6 +18,8 @@
 #include <linux/slab.h>
 #include "gdsc.h"
 
+extern bool rg55g1_preserve_abl_display;
+
 #define PWR_ON_MASK		BIT(31)
 #define EN_REST_WAIT_MASK	GENMASK_ULL(23, 20)
 #define EN_FEW_WAIT_MASK	GENMASK_ULL(19, 16)
@@ -493,10 +495,14 @@ static int gdsc_init(struct gdsc *sc)
 
 		/* Turn on HW trigger mode if supported */
 		if (sc->flags & HW_CTRL) {
+			if (rg55g1_preserve_abl_display &&
+			    (sc->gdscr == 0x9000 || sc->gdscr == 0xb000))
+				goto skip_hwctrl_init;
 			ret = gdsc_hwctrl(sc, true);
 			if (ret < 0)
 				goto err_disable_supply;
 		}
+skip_hwctrl_init:
 
 	} else if (sc->flags & ALWAYS_ON) {
 		/* If ALWAYS_ON GDSCs are not ON, turn them ON */

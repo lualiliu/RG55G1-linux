@@ -3,11 +3,17 @@
  * Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/sizes.h>
+
+extern bool rg55g1_preserve_abl_display;
 
 #include <dt-bindings/clock/qcom,sm4450-dispcc.h>
 
@@ -45,6 +51,23 @@ static const struct pll_vco lucid_evo_vco[] = {
 	{ 249600000, 2020000000, 0 },
 };
 
+/*
+ * Stock rpmhclk often has no xo parent → DT bi_tcxo rate 0 →
+ * "disp_cc_pll0: Rounded rate 0". Always parent PLLs/RCGs from a local
+ * 19.2 MHz fixed clock so MDP set_rate works regardless of DT.
+ */
+static struct clk_fixed_rate disp_cc_bi_tcxo_fixed = {
+	.fixed_rate = 19200000,
+	.hw.init = &(struct clk_init_data) {
+		.name = "disp_cc_bi_tcxo_fixed",
+		.ops = &clk_fixed_rate_ops,
+	},
+};
+
+static struct clk_hw *disp_cc_sm4450_hws[] = {
+	&disp_cc_bi_tcxo_fixed.hw,
+};
+
 /* 600.0 MHz Configuration */
 static const struct alpha_pll_config disp_cc_pll0_config = {
 	.l = 0x1f,
@@ -64,8 +87,8 @@ static struct clk_alpha_pll disp_cc_pll0 = {
 	.clkr = {
 		.hw.init = &(const struct clk_init_data) {
 			.name = "disp_cc_pll0",
-			.parent_data = &(const struct clk_parent_data) {
-				.index = DT_BI_TCXO,
+			.parent_hws = (const struct clk_hw *[]) {
+				&disp_cc_bi_tcxo_fixed.hw,
 			},
 			.num_parents = 1,
 			.ops = &clk_alpha_pll_lucid_evo_ops,
@@ -81,8 +104,8 @@ static struct clk_alpha_pll disp_cc_pll1 = {
 	.clkr = {
 		.hw.init = &(const struct clk_init_data) {
 			.name = "disp_cc_pll1",
-			.parent_data = &(const struct clk_parent_data) {
-				.index = DT_BI_TCXO,
+			.parent_hws = (const struct clk_hw *[]) {
+				&disp_cc_bi_tcxo_fixed.hw,
 			},
 			.num_parents = 1,
 			.ops = &clk_alpha_pll_lucid_evo_ops,
@@ -97,7 +120,7 @@ static const struct parent_map disp_cc_parent_map_0[] = {
 };
 
 static const struct clk_parent_data disp_cc_parent_data_0[] = {
-	{ .index = DT_BI_TCXO },
+	{ .hw = &disp_cc_bi_tcxo_fixed.hw },
 	{ .index = DT_DSI0_PHY_PLL_OUT_DSICLK },
 	{ .index = DT_DSI0_PHY_PLL_OUT_BYTECLK },
 };
@@ -110,7 +133,7 @@ static const struct parent_map disp_cc_parent_map_1[] = {
 };
 
 static const struct clk_parent_data disp_cc_parent_data_1[] = {
-	{ .index = DT_BI_TCXO },
+	{ .hw = &disp_cc_bi_tcxo_fixed.hw },
 	{ .hw = &disp_cc_pll0.clkr.hw },
 	{ .hw = &disp_cc_pll1.clkr.hw },
 	{ .hw = &disp_cc_pll1.clkr.hw },
@@ -121,11 +144,11 @@ static const struct parent_map disp_cc_parent_map_2[] = {
 };
 
 static const struct clk_parent_data disp_cc_parent_data_2[] = {
-	{ .index = DT_BI_TCXO },
+	{ .hw = &disp_cc_bi_tcxo_fixed.hw },
 };
 
 static const struct clk_parent_data disp_cc_parent_data_2_ao[] = {
-	{ .index = DT_BI_TCXO_AO },
+	{ .hw = &disp_cc_bi_tcxo_fixed.hw },
 };
 
 static const struct parent_map disp_cc_parent_map_3[] = {
@@ -135,7 +158,7 @@ static const struct parent_map disp_cc_parent_map_3[] = {
 };
 
 static const struct clk_parent_data disp_cc_parent_data_3[] = {
-	{ .index = DT_BI_TCXO },
+	{ .hw = &disp_cc_bi_tcxo_fixed.hw },
 	{ .hw = &disp_cc_pll1.clkr.hw },
 	{ .hw = &disp_cc_pll1.clkr.hw },
 };
@@ -146,7 +169,7 @@ static const struct parent_map disp_cc_parent_map_4[] = {
 };
 
 static const struct clk_parent_data disp_cc_parent_data_4[] = {
-	{ .index = DT_BI_TCXO },
+	{ .hw = &disp_cc_bi_tcxo_fixed.hw },
 	{ .index = DT_DSI0_PHY_PLL_OUT_BYTECLK },
 };
 
@@ -195,7 +218,8 @@ static struct clk_rcg2 disp_cc_mdss_byte0_clk_src = {
 		.name = "disp_cc_mdss_byte0_clk_src",
 		.parent_data = disp_cc_parent_data_0,
 		.num_parents = ARRAY_SIZE(disp_cc_parent_data_0),
-		.flags = CLK_SET_RATE_PARENT,
+		/* Parent (DSI PHY PLL) must be enabled for RCG update */
+		.flags = CLK_SET_RATE_PARENT | CLK_OPS_PARENT_ENABLE,
 		.ops = &clk_byte2_ops,
 	},
 };
@@ -249,7 +273,7 @@ static struct clk_rcg2 disp_cc_mdss_pclk0_clk_src = {
 		.name = "disp_cc_mdss_pclk0_clk_src",
 		.parent_data = disp_cc_parent_data_0,
 		.num_parents = ARRAY_SIZE(disp_cc_parent_data_0),
-		.flags = CLK_SET_RATE_PARENT,
+		.flags = CLK_SET_RATE_PARENT | CLK_OPS_PARENT_ENABLE,
 		.ops = &clk_pixel_ops,
 	},
 };
@@ -724,6 +748,8 @@ static const struct qcom_cc_desc disp_cc_sm4450_desc = {
 	.config = &disp_cc_sm4450_regmap_config,
 	.clks = disp_cc_sm4450_clocks,
 	.num_clks = ARRAY_SIZE(disp_cc_sm4450_clocks),
+	.clk_hws = disp_cc_sm4450_hws,
+	.num_clk_hws = ARRAY_SIZE(disp_cc_sm4450_hws),
 	.resets = disp_cc_sm4450_resets,
 	.num_resets = ARRAY_SIZE(disp_cc_sm4450_resets),
 	.gdscs = disp_cc_sm4450_gdscs,
@@ -732,18 +758,60 @@ static const struct qcom_cc_desc disp_cc_sm4450_desc = {
 
 static const struct of_device_id disp_cc_sm4450_match_table[] = {
 	{ .compatible = "qcom,sm4450-dispcc" },
+	{ .compatible = "qcom,ravelin-dispcc" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, disp_cc_sm4450_match_table);
 
+/*
+ * Bootloader continuous splash keeps INTF timing running. Stock SDE places
+ * INTF at mdss@ae00000 + 0x36000 = 0xae36000 (MDP@ae01000 catalog offset
+ * 0x35000). Stop the timing engine and drain one frame before RCG/PLL
+ * registration so Linux can take over with a clean modeset (ROCKNIX
+ * WIP_SM4450 approach).
+ */
+static void disp_cc_sm4450_quiesce_splash(void)
+{
+	void __iomem *intf;
+	u32 en;
+
+	intf = ioremap(0xae36000, SZ_4);
+	if (!intf)
+		return;
+
+	en = readl(intf);
+	if (en) {
+		pr_emerg("dispcc-sm4450: quiesce splash INTF_TIMING_ENGINE_EN=0x%x\n",
+			 en);
+		writel(0, intf); /* INTF_TIMING_ENGINE_EN */
+		msleep(50);
+	}
+	iounmap(intf);
+
+	/*
+	 * Stop ABL keep-alive for DSI/DPU/fbdev modeset, but leave
+	 * abl_panel_ready set — keep ABL PHY + skip FT7131M DCS re-init.
+	 * Host timing is still reprogrammed after quiesce so DPU INTF matches.
+	 */
+	rg55g1_preserve_abl_display = false;
+}
+
 static int disp_cc_sm4450_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
+	struct clk *pll0;
+	int ret;
+
+	disp_cc_sm4450_quiesce_splash();
 
 	regmap = qcom_cc_map(pdev, &disp_cc_sm4450_desc);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
+	/*
+	 * Configure lucid PLLs so Linux clk_set_rate(MDP/…) works after the
+	 * splash timing engine has been stopped above.
+	 */
 	clk_lucid_evo_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
 	clk_lucid_evo_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll0_config);
 
@@ -751,7 +819,19 @@ static int disp_cc_sm4450_probe(struct platform_device *pdev)
 	qcom_branch_set_clk_en(regmap, 0xe070); /* DISP_CC_SLEEP_CLK */
 	qcom_branch_set_clk_en(regmap, 0xe054); /* DISP_CC_XO_CLK */
 
-	return qcom_cc_really_probe(&pdev->dev, &disp_cc_sm4450_desc, regmap);
+	ret = qcom_cc_really_probe(&pdev->dev, &disp_cc_sm4450_desc, regmap);
+	if (ret)
+		return ret;
+
+	pll0 = clk_hw_get_clk(&disp_cc_pll0.clkr.hw, "dispcc");
+	if (!IS_ERR(pll0)) {
+		(void)clk_set_rate(pll0, 600000000);
+		pr_emerg("dispcc-sm4450: bi_tcxo_fixed=19200000 pll0 rate=%lu\n",
+			 clk_get_rate(pll0));
+		clk_put(pll0);
+	}
+
+	return 0;
 }
 
 static struct platform_driver disp_cc_sm4450_driver = {
@@ -762,7 +842,26 @@ static struct platform_driver disp_cc_sm4450_driver = {
 	},
 };
 
-module_platform_driver(disp_cc_sm4450_driver);
+static bool dispcc_sm4450_registered;
+
+int rg55g1_dispcc_driver_register(void)
+{
+	int ret;
+
+	if (dispcc_sm4450_registered)
+		return 0;
+
+	ret = platform_driver_register(&disp_cc_sm4450_driver);
+	if (!ret)
+		dispcc_sm4450_registered = true;
+	return ret;
+}
+
+static int __init disp_cc_sm4450_init(void)
+{
+	return rg55g1_dispcc_driver_register();
+}
+module_init(disp_cc_sm4450_init);
 
 MODULE_DESCRIPTION("QTI DISPCC SM4450 Driver");
 MODULE_LICENSE("GPL");

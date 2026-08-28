@@ -21,6 +21,9 @@
 #include "msm_kms.h"
 #include "msm_mmu.h"
 
+/* RG55G1 ABL continuous splash takeover */
+extern bool rg55g1_preserve_abl_display;
+
 static const struct drm_mode_config_funcs mode_config_funcs = {
 	.fb_create = msm_framebuffer_create,
 	.atomic_check = msm_atomic_check,
@@ -195,8 +198,27 @@ struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_de
 	else if (mdss_dev && device_iommu_mapped(mdss_dev))
 		iommu_dev = mdss_dev;
 	else {
-		drm_info(dev, "no IOMMU, bailing out\n");
-		return ERR_PTR(-ENODEV);
+		/*
+		 * RG55G1 keep apps-smmu in firmware/bypass mode. Use identity
+		 * MMU (IOVA == PA) so KMS can still program MDSS scanout.
+		 */
+		drm_info(dev, "no IOMMU — using identity MMU (phys DMA)\n");
+		mmu = msm_identity_mmu_new(mdp_dev);
+		if (IS_ERR(mmu))
+			return ERR_CAST(mmu);
+
+		/*
+		 * IOVA == PA: VA space must cover DRAM (RG55G1 has 4GiB at
+		 * 0x80000000 → phys up to 0x180000000). A 4G VA window causes
+		 * drm_mm ENOSPC (-28) for high pages (e.g. DSI TX GEM).
+		 */
+		vm = msm_gem_vm_create(dev, mmu, "mdp_kms",
+				       0x1000, (1ULL << 36) - 0x1000, true);
+		if (IS_ERR(vm)) {
+			mmu->funcs->destroy(mmu);
+			return vm;
+		}
+		return vm;
 	}
 
 	mmu = msm_iommu_disp_new(iommu_dev, 0);
@@ -384,5 +406,16 @@ void msm_drm_kms_post_init(struct device *dev)
 	struct drm_device *ddev = priv->dev;
 
 	drm_kms_helper_poll_init(ddev);
+
+	/*
+	 * After dispcc quiesce_splash, preserve_abl is cleared and modeset is
+	 * safe. abl_panel_ready may stay set to skip FT7131M re-init.
+	 */
+	if (rg55g1_preserve_abl_display) {
+		pr_emerg("msm: skip drm_client_setup (ABL keep splash, no modeset)\n");
+		return;
+	}
+
+	pr_emerg("msm: drm_client_setup (handoff modeset)\n");
 	drm_client_setup(ddev, NULL);
 }
