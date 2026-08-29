@@ -989,7 +989,11 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 	}
 
 	__set_bit(EV_KEY, input->evbit);
-	__set_bit(INPUT_PROP_DIRECT, input->propbit);
+	/*
+	 * Do NOT set INPUT_PROP_DIRECT. udev/input_id treats DIRECT+ABS as a
+	 * touchscreen (ID_INPUT_TOUCHSCREEN), so EmulationStation/SDL never
+	 * see this device as a joystick.
+	 */
 	for (nbtn = 0; nbtn < joypad->bt_gpio_count; nbtn++) {
 		struct bt_gpio *gpio = &joypad->gpios[nbtn];
 

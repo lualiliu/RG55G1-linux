@@ -92,7 +92,8 @@
 	singleadc_joypad: singleadc-joypad {
 		compatible = "singleadc-joypad";
 		status = "okay";
-		joypad-name = "rocknix-joypad";
+		/* Match stock / ES autoconfig (retrogame_joypad GUID). */
+		joypad-name = "retrogame_joypad";
 		joypad-product = <0x1101>;
 		joypad-revision = <0x0100>;
 		amux-count = <6>;
