@@ -836,12 +836,13 @@ EXPORT_SYMBOL_GPL(wait_for_initramfs);
 static int __init populate_rootfs(void)
 {
 	extern bool rg55g1_block_deferred;
+	extern bool rg55g1_force_sync_rootfs;
 
 	/*
-	 * RG55G1: async unpack + wait_for_initramfs wedges (last screen
-	 * mark was magenta after do_basic_setup). Unpack synchronously.
+	 * RG55G1: async unpack + concurrent device probe wedges (black screen
+	 * stuck at UNPACK). Always unpack synchronously on this platform.
 	 */
-	if (rg55g1_block_deferred) {
+	if (rg55g1_block_deferred || rg55g1_force_sync_rootfs) {
 		extern void rg55g1_status(const char *msg, u32 color);
 
 		rg55g1_status("SYNC-RD", 0x00ff8000);

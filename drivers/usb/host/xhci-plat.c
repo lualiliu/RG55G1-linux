@@ -256,24 +256,26 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 			}
 		}
 
-		/* Rotate: U2 portsc / HS_PHY_CTRL+GUSB2 / EUD+UTMI */
-		switch (p->ticks % 3) {
-		case 0:
-			snprintf(msg, sizeof(msg), "%sU2:c%dp%de%dL%x",
-				 quiet && !edge_kick ? "Q" : "",
-				 !!(u2 & PORT_CONNECT),
-				 !!(u2 & PORT_POWER),
-				 !!(u2 & PORT_PE),
-				 (u2 & PORT_PLS_MASK) >> 5);
-			break;
-		case 1:
-			snprintf(msg, sizeof(msg), "H%08x G%08x", hs, cfg);
-			break;
-		default:
-			snprintf(msg, sizeof(msg), "E%08x P%08x", ecsr, utmi);
-			break;
+		/* Throttle status strip (~5s) so boot markers stay readable. */
+		if (p->ticks % 25 == 0) {
+			switch ((p->ticks / 25) % 3) {
+			case 0:
+				snprintf(msg, sizeof(msg), "%sU2:c%dp%de%dL%x",
+					 quiet && !edge_kick ? "Q" : "",
+					 !!(u2 & PORT_CONNECT),
+					 !!(u2 & PORT_POWER),
+					 !!(u2 & PORT_PE),
+					 (u2 & PORT_PLS_MASK) >> 5);
+				break;
+			case 1:
+				snprintf(msg, sizeof(msg), "H%08x G%08x", hs, cfg);
+				break;
+			default:
+				snprintf(msg, sizeof(msg), "E%08x P%08x", ecsr, utmi);
+				break;
+			}
+			rg55g1_status(msg, (u2 & PORT_CONNECT) ? 0x0000ff00 : 0x00ffff00);
 		}
-		rg55g1_status(msg, (u2 & PORT_CONNECT) ? 0x0000ff00 : 0x00ffff00);
 		p->last_u2 = u2;
 		p->last_u3 = u3;
 	}

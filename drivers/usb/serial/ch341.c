@@ -890,7 +890,17 @@ static struct usb_serial_driver * const serial_drivers[] = {
 /* RG55G1 skips LV6 device_initcall; rg55g1_usb_serial_bringup() calls this. */
 int __init ch341_init(void)
 {
-	return usb_serial_register_drivers(serial_drivers, KBUILD_MODNAME, id_table);
+	static bool registered;
+	int ret;
+
+	if (registered)
+		return 0;
+
+	ret = usb_serial_register_drivers(serial_drivers, KBUILD_MODNAME,
+					  id_table);
+	if (!ret)
+		registered = true;
+	return ret;
 }
 
 static void __exit ch341_exit(void)

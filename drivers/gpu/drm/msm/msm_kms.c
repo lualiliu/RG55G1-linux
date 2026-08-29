@@ -23,6 +23,7 @@
 
 /* RG55G1 ABL continuous splash takeover */
 extern bool rg55g1_preserve_abl_display;
+void rg55g1_dispcc_quiesce_splash(void);
 
 static const struct drm_mode_config_funcs mode_config_funcs = {
 	.fb_create = msm_framebuffer_create,
@@ -408,11 +409,13 @@ void msm_drm_kms_post_init(struct device *dev)
 	drm_kms_helper_poll_init(ddev);
 
 	/*
-	 * After dispcc quiesce_splash, preserve_abl is cleared and modeset is
-	 * safe. abl_panel_ready may stay set to skip FT7131M re-init.
+	 * Do NOT quiesce ABL splash here. Stopping INTF then calling
+	 * drm_client_setup() hangs/fails on this panel and leaves a black
+	 * screen with no console. Keep continuous splash until a known-good
+	 * handoff path is ready (rg55g1.msm=1 + future safe modeset).
 	 */
 	if (rg55g1_preserve_abl_display) {
-		pr_emerg("msm: skip drm_client_setup (ABL keep splash, no modeset)\n");
+		pr_emerg("msm: skip drm_client_setup (keep ABL splash)\n");
 		return;
 	}
 

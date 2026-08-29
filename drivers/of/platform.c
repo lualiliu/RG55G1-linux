@@ -621,9 +621,17 @@ arch_initcall_sync(of_platform_default_populate_init);
 static int __init of_platform_sync_state_init(void)
 {
 	extern bool rg55g1_skip_of_populate;
+	extern bool rg55g1_force_sync_rootfs;
 
-	if (rg55g1_skip_of_populate)
+	/*
+	 * LV6/mainline: sync_state resume can block forever on RPMh/ICC
+	 * suppliers (no /init). Stock LV6-skip already returns early via
+	 * rg55g1_skip_of_populate; do the same when we force sync rootfs.
+	 */
+	if (rg55g1_skip_of_populate || rg55g1_force_sync_rootfs) {
+		pr_emerg("rg55g1: skip of_platform_sync_state_init\n");
 		return 0;
+	}
 	device_links_supplier_sync_state_resume();
 	return 0;
 }

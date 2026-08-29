@@ -667,9 +667,9 @@ static int __init rg55g1_splash_fbdev_register(void)
 		pr_emerg("rg55g1: MSM display failed (%d), trying simpledrm\n", ret);
 	} else if (rg55g1_msm_auto) {
 		/*
-		 * MSM comes up ~4s via USB bringup. Skip simpledrm entirely so
-		 * it never claims card0/fb — MSM will be the only DRM device.
-		 * Splash fb0 stays for the status strip until INTF quiesce.
+		 * MSM comes up via OF populate (mainline/lv6) or USB bringup.
+		 * Skip simpledrm so it never claims card0/fb — splash fb0 stays
+		 * until MSM post_init quiesces INTF and modesets.
 		 */
 		rg55g1_disable_simple_framebuffer_dt();
 		rg55g1_sanitize_dt();

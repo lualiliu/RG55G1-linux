@@ -200,11 +200,9 @@ static int rg55g1_ensure_dispcc(void)
 
 	msleep(100);
 	rg55g1_msm_unblock_deferred_probe();
-	/* Ensure handoff flags: modeset ok, keep panel init skip. */
-	rg55g1_preserve_abl_display = false;
-	/* do not clear rg55g1_abl_panel_ready — panel still ABL-programmed */
+	/* Keep ABL splash until KMS is ready — quiesce happens on KMS-OK. */
 	rg55g1_status("DISPCC-OK", 0x0000ff00);
-	pr_emerg("rg55g1: dispcc probe done (splash quiesced, MSM modeset ok)\n");
+	pr_emerg("rg55g1: dispcc probe done (ABL splash still active)\n");
 	return 0;
 }
 
@@ -641,11 +639,7 @@ static int rg55g1_msm_display_proceed(void)
 		put_device(&pdev->dev);
 
 		ret = rg55g1_msm_wait_drm(mdss_np);
-		rg55g1_skip_mdss_reset = false;
-		rg55g1_skip_mdss_populate = false;
-		if (!ret)
-			rg55g1_preserve_abl_display = false;
-		else
+		if (ret)
 			rg55g1_splash_resync();
 		of_node_put(mdss_np);
 		return ret;
@@ -655,11 +649,7 @@ static int rg55g1_msm_display_proceed(void)
 
 	if (rg55g1_mdss_bound(mdss_np)) {
 		ret = rg55g1_msm_wait_drm(mdss_np);
-		rg55g1_skip_mdss_reset = false;
-		rg55g1_skip_mdss_populate = false;
-		if (!ret)
-			rg55g1_preserve_abl_display = false;
-		else
+		if (ret)
 			rg55g1_splash_resync();
 		of_node_put(mdss_np);
 		return ret;
@@ -669,8 +659,6 @@ static int rg55g1_msm_display_proceed(void)
 	pr_emerg("rg55g1: MDSS created but not bound yet\n");
 	rg55g1_dump_deferred_pending();
 	of_node_put(mdss_np);
-	rg55g1_skip_mdss_reset = false;
-	rg55g1_skip_mdss_populate = false;
 	/* Keep ABL splash until MSM binds — do not clear preserve_abl_display. */
 	rg55g1_splash_resync();
 	return -EPROBE_DEFER;
@@ -789,3 +777,27 @@ int __init rg55g1_populate_msm_display(void)
 	}
 	return ret;
 }
+
+/*
+ * Full LV6 path does not run USB bringup's MSM retry. After devices settle,
+ * perform controlled display handoff (mdss/dispcc stay disabled in DT until
+ * ensure_* force-enables them).
+ */
+static int __init rg55g1_msm_late_bringup(void)
+{
+	int ret;
+
+	/* Opt-in only: default cmdline leaves msm= off so simpledrm owns fb. */
+	if (!rg55g1_msm_auto && !rg55g1_msm_early)
+		return 0;
+
+	rg55g1_status("MSM-LATE", 0x00ff8000);
+	ret = rg55g1_msm_display_retry();
+	if (!ret)
+		pr_emerg("rg55g1: MSM display probe done (late; splash kept until modeset)\n");
+	else if (ret != -ENODEV)
+		pr_emerg("rg55g1: MSM late bringup: %d (splash kept)\n", ret);
+	rg55g1_splash_resync();
+	return 0;
+}
+late_initcall_sync(rg55g1_msm_late_bringup);

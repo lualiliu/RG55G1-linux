@@ -1612,15 +1612,24 @@ static int __ref kernel_init(void *unused)
 	kernel_init_freeable();
 	{
 		extern bool rg55g1_block_deferred;
+		extern bool rg55g1_force_sync_rootfs;
 
+		pr_emerg("rg55g1: kernel_init_freeable done\n");
 		/*
 		 * async_synchronize_full() waits on every async domain and can
 		 * wedge forever on this bring-up (blocked deferred probes, etc.).
+		 * Skip whenever we are on the RG55G1 sync-rootfs / LV6 path.
 		 */
-		if (!rg55g1_block_deferred)
+		if (!rg55g1_block_deferred && !rg55g1_force_sync_rootfs) {
+			pr_emerg("rg55g1: async_synchronize_full...\n");
 			async_synchronize_full();
+			pr_emerg("rg55g1: async_synchronize_full done\n");
+		} else {
+			pr_emerg("rg55g1: skip async_synchronize_full\n");
+		}
 	}
 
+	pr_emerg("rg55g1: freeing initmem...\n");
 	system_state = SYSTEM_FREEING_INITMEM;
 	kprobe_free_init_mem();
 	ftrace_free_init_mem();
@@ -1773,11 +1782,15 @@ static noinline void __init kernel_init_freeable(void)
 				pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
 					ramdisk_execute_command, ramdisk_command_access);
 			ramdisk_execute_command = NULL;
-			/* prepare_namespace() hangs with no root= on this bring-up */
-			if (!rg55g1_block_deferred)
-				prepare_namespace();
-			else
-				pr_emerg("rg55g1: skip prepare_namespace\n");
+			/*
+			 * prepare_namespace() + rootwait hangs with no usable
+			 * root= (initramfs already has /init). Never call it on
+			 * RG55G1 — Rocknix /init mounts LABEL=ROCKNIX itself.
+			 */
+			pr_emerg("rg55g1: skip prepare_namespace (use embedded /init)\n");
+		} else {
+			pr_emerg("rg55g1: rdinit %s ok — will exec after free_initmem\n",
+				 ramdisk_execute_command);
 		}
 	}
 

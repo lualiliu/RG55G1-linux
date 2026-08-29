@@ -775,6 +775,16 @@ static void disp_cc_sm4450_quiesce_splash(void)
 	void __iomem *intf;
 	u32 en;
 
+	/*
+	 * While ABL continuous splash must stay visible (preserve_abl), do not
+	 * stop INTF — early quiesce here left a black panel when MSM modeset
+	 * failed or lagged after splash fb registration.
+	 */
+	if (rg55g1_preserve_abl_display) {
+		pr_emerg("dispcc-sm4450: defer INTF quiesce (ABL splash preserve)\n");
+		return;
+	}
+
 	intf = ioremap(0xae36000, SZ_4);
 	if (!intf)
 		return;
@@ -787,14 +797,14 @@ static void disp_cc_sm4450_quiesce_splash(void)
 		msleep(50);
 	}
 	iounmap(intf);
-
-	/*
-	 * Stop ABL keep-alive for DSI/DPU/fbdev modeset, but leave
-	 * abl_panel_ready set — keep ABL PHY + skip FT7131M DCS re-init.
-	 * Host timing is still reprogrammed after quiesce so DPU INTF matches.
-	 */
-	rg55g1_preserve_abl_display = false;
 }
+
+void rg55g1_dispcc_quiesce_splash(void)
+{
+	rg55g1_preserve_abl_display = false;
+	disp_cc_sm4450_quiesce_splash();
+}
+EXPORT_SYMBOL_GPL(rg55g1_dispcc_quiesce_splash);
 
 static int disp_cc_sm4450_probe(struct platform_device *pdev)
 {
@@ -809,11 +819,15 @@ static int disp_cc_sm4450_probe(struct platform_device *pdev)
 		return PTR_ERR(regmap);
 
 	/*
-	 * Configure lucid PLLs so Linux clk_set_rate(MDP/…) works after the
-	 * splash timing engine has been stopped above.
+	 * While ABL continuous splash is live, do not touch lucid PLLs —
+	 * reconfiguring them stops panel scanout (black hang after splash fb).
 	 */
-	clk_lucid_evo_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
-	clk_lucid_evo_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll0_config);
+	if (!rg55g1_preserve_abl_display) {
+		clk_lucid_evo_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
+		clk_lucid_evo_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll0_config);
+	} else {
+		pr_emerg("dispcc-sm4450: skip PLL reconfigure (ABL splash preserve)\n");
+	}
 
 	/* Keep some clocks always enabled */
 	qcom_branch_set_clk_en(regmap, 0xe070); /* DISP_CC_SLEEP_CLK */
@@ -823,12 +837,14 @@ static int disp_cc_sm4450_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	pll0 = clk_hw_get_clk(&disp_cc_pll0.clkr.hw, "dispcc");
-	if (!IS_ERR(pll0)) {
-		(void)clk_set_rate(pll0, 600000000);
-		pr_emerg("dispcc-sm4450: bi_tcxo_fixed=19200000 pll0 rate=%lu\n",
-			 clk_get_rate(pll0));
-		clk_put(pll0);
+	if (!rg55g1_preserve_abl_display) {
+		pll0 = clk_hw_get_clk(&disp_cc_pll0.clkr.hw, "dispcc");
+		if (!IS_ERR(pll0)) {
+			(void)clk_set_rate(pll0, 600000000);
+			pr_emerg("dispcc-sm4450: bi_tcxo_fixed=19200000 pll0 rate=%lu\n",
+				 clk_get_rate(pll0));
+			clk_put(pll0);
+		}
 	}
 
 	return 0;

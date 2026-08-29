@@ -44,10 +44,15 @@ EXPORT_SYMBOL_GPL(rg55g1_preserve_abl_display);
 
 bool rg55g1_abl_panel_ready = true;
 EXPORT_SYMBOL_GPL(rg55g1_abl_panel_ready);
-bool rg55g1_skip_mdss_reset;
-bool rg55g1_skip_mdss_populate;
+/* Default on: OF must not reset/populate MDSS while ABL splash is scanning. */
+bool rg55g1_skip_mdss_reset = true;
+bool rg55g1_skip_mdss_populate = true;
 EXPORT_SYMBOL_GPL(rg55g1_skip_mdss_reset);
 EXPORT_SYMBOL_GPL(rg55g1_skip_mdss_populate);
+
+/* Always sync-unpack initramfs on this board (async + device probe wedges). */
+bool rg55g1_force_sync_rootfs = true;
+EXPORT_SYMBOL_GPL(rg55g1_force_sync_rootfs);
 
 /* When set, PHY may proceed without PMIC regulators (bootloader left USB up). */
 bool rg55g1_usb_loose_supplies = true;
@@ -105,6 +110,43 @@ void rg55g1_force_node_disabled(struct device_node *np)
 }
 EXPORT_SYMBOL_GPL(rg55g1_force_node_disabled);
 
+static bool rg55g1_want_lv6;
+
+static bool rg55g1_is_mainline_board(void)
+{
+	/* Stock flattened DTB used qcom,ravelinp; mainline uses anbernic + sm4450. */
+	return of_machine_is_compatible("anbernic,rg55g1") ||
+	       (of_machine_is_compatible("qcom,sm4450") &&
+		!of_machine_is_compatible("qcom,ravelinp"));
+}
+
+static struct device_node *rg55g1_find_soc_node(void)
+{
+	struct device_node *soc;
+
+	/* Mainline sm4450.dtsi uses soc@0; stock flattened DT used /soc. */
+	soc = of_find_node_by_path("/soc@0");
+	if (!soc)
+		soc = of_find_node_by_path("/soc");
+	return soc;
+}
+
+static bool rg55g1_is_hsphy(struct device_node *np)
+{
+	return of_device_is_compatible(np, "qcom,usb-hsphy-snps-femto") ||
+	       of_device_is_compatible(np, "qcom,usb-snps-femto-v2-phy") ||
+	       of_device_is_compatible(np, "qcom,usb-snps-hs-7nm-phy") ||
+	       of_device_is_compatible(np, "qcom,sm4450-usb-hs-phy");
+}
+
+static bool rg55g1_is_dwc_glue(struct device_node *np)
+{
+	return of_device_is_compatible(np, "qcom,dwc-usb3-msm") ||
+	       of_device_is_compatible(np, "qcom,dwc3") ||
+	       of_device_is_compatible(np, "qcom,snps-dwc3") ||
+	       of_device_is_compatible(np, "qcom,sm4450-dwc3");
+}
+
 static bool rg55g1_is_sdhci(struct device_node *np)
 {
 	return of_device_is_compatible(np, "qcom,sdhci-msm-v5") ||
@@ -146,12 +188,9 @@ static bool rg55g1_is_usb_keep(struct device_node *np)
 	/* HS-only: skip SS PHY and nop-xceiv (legacy usb-phy / dummy vbus). */
 	return of_device_is_compatible(np, "qcom,ravelin-gcc") ||
 	       of_device_is_compatible(np, "qcom,sm4450-gcc") ||
-	       of_device_is_compatible(np, "qcom,dwc-usb3-msm") ||
-	       of_device_is_compatible(np, "qcom,dwc3") ||
-	       of_device_is_compatible(np, "qcom,snps-dwc3") ||
+	       rg55g1_is_dwc_glue(np) ||
 	       of_device_is_compatible(np, "snps,dwc3") ||
-	       of_device_is_compatible(np, "qcom,usb-hsphy-snps-femto") ||
-	       of_device_is_compatible(np, "qcom,usb-snps-femto-v2-phy") ||
+	       rg55g1_is_hsphy(np) ||
 	       of_device_is_compatible(np, "qcom,spmi-pmic-arb") ||
 	       of_device_is_compatible(np, "qcom,spmi-pmic-arb-debug") ||
 	       /*
@@ -399,15 +438,27 @@ static void rg55g1_patch_ssusb_glue(struct device_node *ssusb)
 
 /**
  * rg55g1_sanitize_dt() - disable hang-prone DT nodes; keep USB/GCC/SDHCI.
+ *
+ * Mainline board + rg55g1.lv6=1: do NOT flip block_deferred / skip_of_populate.
+ * Splash runs at fs_initcall *before* rootfs_initcall; the old code re-armed
+ * LV6-skip here and forced SYNC-RD even when the user passed lv6=1, then MSM
+ * quiesced ABL splash into a black screen when modeset lagged.
  */
 int rg55g1_sanitize_dt(void)
 {
 	int n = 0;
 	struct device_node *rm, *child, *ramo;
+	bool keep_lv6 = rg55g1_want_lv6 || rg55g1_is_mainline_board();
+
+	if (keep_lv6) {
+		pr_emerg("rg55g1: DT sanitize skipped (mainline/lv6 — keep OF populate)\n");
+		return 0;
+	}
 
 	rg55g1_block_deferred = true;
 	rg55g1_skip_of_populate = true;
 
+	/* Stock flattened DT used /soc; mainline uses /soc@0 (kept above). */
 	n += rg55g1_disable_children("/soc");
 	n += rg55g1_disable_children("/firmware");
 
@@ -1388,11 +1439,18 @@ static int rg55g1_enable_pm7250b_vbus(void)
 	int ret;
 
 	/* Always refresh sticky line (USB spam used to scroll it away). */
+	if (vbus_keep_ctrl) {
+		rg55g1_status_vbus(last, last_color);
+		return 0;
+	}
+	/*
+	 * Do not latch done on NO-SPMI — SPMI may probe after the first
+	 * EXEC-INIT refresh (mainline DT used to lack arb nodes entirely).
+	 */
 	if (done) {
 		rg55g1_status_vbus(last, last_color);
 		return last_ret;
 	}
-	done = true;
 
 	rg55g1_status_vbus("VBUS-SCAN", 0x00ffff00);
 	rg55g1_status("VBUS-SCAN", 0x00ffff00);
@@ -1411,8 +1469,11 @@ static int rg55g1_enable_pm7250b_vbus(void)
 		last_color = 0x00ff0000;
 		last_ret = -ENODEV;
 		rg55g1_status_vbus(last, last_color);
+		/* Allow retry once controllers appear. */
 		return last_ret;
 	}
+
+	done = true;
 
 	pr_emerg("rg55g1: SPMI main=%s debug=%s — scan SID 0..15 for OTG\n",
 		 main_ctrl ? "ok" : "no", dbg_ctrl ? "ok" : "no");
@@ -1775,16 +1836,25 @@ static int rg55g1_enable_hsphy_rails(void)
 	 * 8) and a probe after our raw vote races IRQs → WARN at :451.
 	 * Raw MMIO vote is enough for PHY LDOs.
 	 */
-	rsc_np = of_find_node_by_path("/soc/rsc@17a00000");
+	/*
+	 * Mainline sm4450.dtsi apps_rsc already has valid 8-cell tcs-config —
+	 * keep it for rpmh regulators (SD/USB supplies). Only sanitize stock.
+	 */
+	rsc_np = of_find_node_by_path("/soc@0/rsc@17a00000");
+	if (!rsc_np)
+		rsc_np = of_find_node_by_path("/soc/rsc@17a00000");
 	if (rsc_np) {
 		int ne = of_property_count_u32_elems(rsc_np, "qcom,tcs-config");
 
-		pr_emerg("rg55g1: stock tcs-config elems=%d (need 8)\n", ne);
+		pr_emerg("rg55g1: tcs-config elems=%d (need 8) mainline=%d\n",
+			 ne, rg55g1_is_mainline_board());
 		if (ne != 8)
 			rg55g1_set_u32_array_prop(rsc_np, "qcom,tcs-config",
 						  tcs_fix, ARRAY_SIZE(tcs_fix));
-		rg55g1_remove_prop(rsc_np, "power-domains");
-		rg55g1_force_disabled_node(rsc_np);
+		if (!rg55g1_is_mainline_board()) {
+			rg55g1_remove_prop(rsc_np, "power-domains");
+			rg55g1_force_disabled_node(rsc_np);
+		}
 		of_node_put(rsc_np);
 	}
 
@@ -2345,7 +2415,7 @@ static int rg55g1_bringup_mmc(void)
 		of_node_put(gcc);
 	}
 
-	soc = of_find_node_by_path("/soc");
+	soc = rg55g1_find_soc_node();
 	if (!soc) {
 		rg55g1_status("MMC-NOSOC", 0x00ff0000);
 		return -ENODEV;
@@ -2353,6 +2423,7 @@ static int rg55g1_bringup_mmc(void)
 
 	for_each_child_of_node(soc, child) {
 		bool emmc;
+		bool mainline;
 		u32 clocks[4], resets[2];
 
 		if (!rg55g1_is_sdhci(child))
@@ -2369,15 +2440,13 @@ static int rg55g1_bringup_mmc(void)
 		}
 
 		rg55g1_force_status(child, "okay");
-		/*
-		 * SD stays in the slot; avoid broken-cd polling (CMD13 every
-		 * second) which hits the controller after runtime suspend.
-		 */
-		rg55g1_set_string_prop(child, "non-removable", "");
-		rg55g1_remove_prop(child, "broken-cd");
-		rg55g1_set_string_prop(child, "qcom,force-pio", "");
+		mainline = of_device_is_compatible(child, "qcom,sm4450-sdhci") &&
+			   of_property_present(child, "vmmc-supply");
 
-		/* Avoid -EPROBE_DEFER on missing providers. */
+		/*
+		 * Apps-SMMU is MMIO-bypassed; do not bind arm-smmu. Drop ICC
+		 * (provider may not be up under LV6 skip).
+		 */
 		rg55g1_remove_prop(child, "iommus");
 		rg55g1_remove_prop(child, "qcom,iommu-dma");
 		rg55g1_remove_prop(child, "qcom,iommu-dma-addr-pool");
@@ -2390,49 +2459,59 @@ static int rg55g1_bringup_mmc(void)
 		rg55g1_remove_prop(child, "vdd-io-supply");
 		rg55g1_remove_prop(child, "vdd-en-dis-supply");
 		rg55g1_remove_prop(child, "vdd-io-en-dis-supply");
-		/* Keep dtbo vmmc/vqmmc if present; strip Android-only names. */
-		rg55g1_remove_prop(child, "vmmc-supply");
-		rg55g1_remove_prop(child, "vqmmc-supply");
-		rg55g1_remove_prop(child, "pinctrl-0");
-		rg55g1_remove_prop(child, "pinctrl-1");
-		rg55g1_remove_prop(child, "pinctrl-names");
-		rg55g1_remove_prop(child, "cd-gpios");
 		rg55g1_remove_prop(child, "qcom,dll-hsr-list");
 		rg55g1_remove_prop(child, "qcom,ice-clk-rates");
 		rg55g1_remove_prop(child, "qcom,devfreq,freq-table");
-		/* Limit init speed until regulators/pinctrl are wired. */
-		rg55g1_set_u32_prop(child, "max-frequency", 25000000);
+		rg55g1_remove_prop(child, "broken-cd");
+		rg55g1_set_string_prop(child, "qcom,force-pio", "");
 
-		if (gcc_ph) {
-			clocks[0] = gcc_ph;
-			clocks[1] = GCC_SDCC2_AHB_CLK;
-			clocks[2] = gcc_ph;
-			clocks[3] = GCC_SDCC2_APPS_CLK;
-			resets[0] = gcc_ph;
-			resets[1] = GCC_SDCC2_BCR;
-			rg55g1_set_u32_array_prop(child, "clocks", clocks, 4);
-			rg55g1_set_u32_array_prop(child, "resets", resets, 2);
-			/* clock-names = "iface", "core" */
-			{
-				static const char names[] = "iface\0core";
-				struct property *pp;
-				char *val;
+		if (mainline) {
+			/* Keep vmmc/vqmmc/pinctrl/cd-gpios from mainline board DT. */
+			pr_emerg("rg55g1: MMC mainline path for %pOF\n", child);
+		} else {
+			/*
+			 * Stock: SD stays in slot; avoid broken-cd polling.
+			 * Strip Android regulator/pinctrl phandles that defer.
+			 */
+			rg55g1_set_string_prop(child, "non-removable", "");
+			rg55g1_remove_prop(child, "vmmc-supply");
+			rg55g1_remove_prop(child, "vqmmc-supply");
+			rg55g1_remove_prop(child, "pinctrl-0");
+			rg55g1_remove_prop(child, "pinctrl-1");
+			rg55g1_remove_prop(child, "pinctrl-names");
+			rg55g1_remove_prop(child, "cd-gpios");
+			rg55g1_set_u32_prop(child, "max-frequency", 25000000);
 
-				val = kmemdup(names, sizeof(names), GFP_KERNEL);
-				if (val) {
-					pp = kzalloc(sizeof(*pp), GFP_KERNEL);
-					if (pp) {
-						pp->name = "clock-names";
-						pp->length = sizeof(names);
-						pp->value = val;
-						of_update_property(child, pp);
-					} else {
-						kfree(val);
+			if (gcc_ph) {
+				clocks[0] = gcc_ph;
+				clocks[1] = GCC_SDCC2_AHB_CLK;
+				clocks[2] = gcc_ph;
+				clocks[3] = GCC_SDCC2_APPS_CLK;
+				resets[0] = gcc_ph;
+				resets[1] = GCC_SDCC2_BCR;
+				rg55g1_set_u32_array_prop(child, "clocks", clocks, 4);
+				rg55g1_set_u32_array_prop(child, "resets", resets, 2);
+				{
+					static const char names[] = "iface\0core";
+					struct property *pp;
+					char *val;
+
+					val = kmemdup(names, sizeof(names), GFP_KERNEL);
+					if (val) {
+						pp = kzalloc(sizeof(*pp), GFP_KERNEL);
+						if (pp) {
+							pp->name = "clock-names";
+							pp->length = sizeof(names);
+							pp->value = val;
+							of_update_property(child, pp);
+						} else {
+							kfree(val);
+						}
 					}
 				}
+				rg55g1_set_string_prop(child, "reset-names",
+							"core_reset");
 			}
-			rg55g1_set_string_prop(child, "reset-names",
-						"core_reset");
 		}
 
 		if (!of_platform_device_create(child, NULL, NULL)) {
@@ -2718,7 +2797,7 @@ int rg55g1_bringup_usb(void)
 	/* Type-C dual-role (OTG keyboard / USB sink charge) on PM7250B. */
 	(void)rg55g1_enable_pm7250b_vbus();
 
-	soc = of_find_node_by_path("/soc");
+	soc = rg55g1_find_soc_node();
 	if (!soc) {
 		rg55g1_status("USB-NOSOC", 0x00ff0000);
 		return -ENODEV;
@@ -2751,7 +2830,13 @@ int rg55g1_bringup_usb(void)
 
 	(void)rg55g1_bringup_apps_smmu();
 
-	hsphy = of_find_compatible_node(NULL, NULL, "qcom,usb-hsphy-snps-femto");
+	hsphy = of_find_compatible_node(NULL, NULL, "qcom,usb-snps-hs-7nm-phy");
+	if (!hsphy)
+		hsphy = of_find_compatible_node(NULL, NULL,
+						"qcom,sm4450-usb-hs-phy");
+	if (!hsphy)
+		hsphy = of_find_compatible_node(NULL, NULL,
+						"qcom,usb-hsphy-snps-femto");
 	if (!hsphy)
 		hsphy = of_find_compatible_node(NULL, NULL,
 						"qcom,usb-snps-femto-v2-phy");
@@ -2772,13 +2857,8 @@ int rg55g1_bringup_usb(void)
 		for_each_child_of_node(soc, child) {
 			bool is_gcc = of_device_is_compatible(child, "qcom,ravelin-gcc") ||
 				      of_device_is_compatible(child, "qcom,sm4450-gcc");
-			bool is_phy =
-				of_device_is_compatible(child, "qcom,usb-hsphy-snps-femto") ||
-				of_device_is_compatible(child, "qcom,usb-snps-femto-v2-phy");
-			bool is_dwc =
-				of_device_is_compatible(child, "qcom,dwc-usb3-msm") ||
-				of_device_is_compatible(child, "qcom,dwc3") ||
-				of_device_is_compatible(child, "qcom,snps-dwc3");
+			bool is_phy = rg55g1_is_hsphy(child);
+			bool is_dwc = rg55g1_is_dwc_glue(child);
 
 			if (!rg55g1_is_usb_keep(child))
 				continue;
@@ -2917,10 +2997,65 @@ static int __init rg55g1_msm_auto_setup(char *str)
 }
 early_param("rg55g1.msm", rg55g1_msm_auto_setup);
 
+static int __init rg55g1_lv6_setup(char *str)
+{
+	rg55g1_want_lv6 = true;
+	rg55g1_block_deferred = false;
+	rg55g1_skip_of_populate = false;
+	pr_emerg("rg55g1: LV6+ initcalls enabled (rg55g1.lv6=1)\n");
+	return 0;
+}
+early_param("rg55g1.lv6", rg55g1_lv6_setup);
+
+static int __init rg55g1_vbus_after_devices(void)
+{
+	int i, ret = -ENODEV;
+
+	/*
+	 * Full LV6 path never calls rg55g1_bringup_usb(); enable OTG VBUS
+	 * once SPMI has had a chance to probe so USB-HOST can enumerate.
+	 * Also start CH340→ttyUSB dmesg mirror (that used to live in USB bringup).
+	 */
+	rg55g1_status("VBUS-IC", 0x00ff8000);
+	rg55g1_usb_phy_clk_reset();
+	rg55g1_hsphy_force_wake();
+	rg55g1_disable_eud();
+	(void)rg55g1_enable_hsphy_rails();
+	/* LV6 never calls rg55g1_bringup_mmc() — still need SD clocks/rails. */
+	rg55g1_sdcc_clk_force();
+	(void)rg55g1_enable_sd_rails();
+	for (i = 0; i < 8; i++) {
+		ret = rg55g1_vbus_refresh();
+		if (!ret)
+			break;
+		msleep(250);
+	}
+	pr_emerg("rg55g1: VBUS after devices: %d\n", ret);
+
+	/* Start only — never flush here (flush slept 3s+ and stalled init). */
+	rg55g1_log_export_start();
+	return 0;
+}
+device_initcall_sync(rg55g1_vbus_after_devices);
+
 static int __init rg55g1_bringup_early_flags(void)
 {
-	rg55g1_block_deferred = true;
-	rg55g1_skip_of_populate = true;
+	/*
+	 * Default: skip LV6+ (stock of_platform hang). Mainline board DT is
+	 * safe enough for full device_initcall — auto-enable when detected,
+	 * or when the user passed rg55g1.lv6=1.
+	 */
+	if (rg55g1_is_mainline_board()) {
+		rg55g1_want_lv6 = true;
+		rg55g1_block_deferred = false;
+		rg55g1_skip_of_populate = false;
+		pr_emerg("rg55g1: mainline DT — LV6+ initcalls enabled\n");
+		return 0;
+	}
+	if (!rg55g1_want_lv6) {
+		rg55g1_block_deferred = true;
+		rg55g1_skip_of_populate = true;
+	}
 	return 0;
 }
 early_initcall(rg55g1_bringup_early_flags);

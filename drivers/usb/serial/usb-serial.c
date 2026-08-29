@@ -1313,7 +1313,11 @@ struct tty_driver *usb_serial_tty_driver;
 /* RG55G1 skips LV6 device_initcall; rg55g1_usb_serial_bringup() calls this. */
 int __init usb_serial_init(void)
 {
+	static bool registered;
 	int result;
+
+	if (registered)
+		return 0;
 
 	usb_serial_tty_driver = tty_alloc_driver(USB_SERIAL_TTY_MINORS,
 			TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV);
@@ -1352,6 +1356,7 @@ int __init usb_serial_init(void)
 		goto err_unregister_driver;
 	}
 
+	registered = true;
 	return result;
 
 err_unregister_driver:

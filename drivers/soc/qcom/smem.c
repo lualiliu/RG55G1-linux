@@ -1251,10 +1251,17 @@ static int qcom_smem_probe(struct platform_device *pdev)
 	/* Skip DRAMC parse — unknown layouts warn then later paths hang. */
 	smem->debugfs_dir = NULL;
 
+	/*
+	 * Stock LV6-skip path blocks deferred probe after smem. Do not re-arm
+	 * that when mainline/lv6 left block_deferred cleared — splash msm=1
+	 * sanitize used to fight the same flag and force a black-screen path.
+	 */
 	{
+		extern bool rg55g1_skip_of_populate;
 		extern bool rg55g1_block_deferred;
 
-		rg55g1_block_deferred = true;
+		if (rg55g1_skip_of_populate)
+			rg55g1_block_deferred = true;
 	}
 
 	__smem = smem;

@@ -10,10 +10,12 @@
 #include <linux/console.h>
 #include <linux/delay.h>
 #include <linux/export.h>
+#include <linux/jiffies.h>
 #include <linux/kfifo.h>
 #include <linux/kmsg_dump.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
@@ -23,6 +25,7 @@
 #include <linux/types.h>
 #include <linux/usb.h>
 #include <linux/usb/serial.h>
+#include <linux/workqueue.h>
 
 #include "rg55g1_bringup.h"
 
@@ -41,6 +44,7 @@ static struct usb_serial_port *rg55g1_log_port;
 static struct notifier_block rg55g1_log_usb_nb;
 static atomic_t rg55g1_log_usb_seen;
 static bool rg55g1_log_console_registered;
+static DEFINE_MUTEX(rg55g1_log_lock);
 
 static const struct tty_operations rg55g1_log_fake_tty_ops;
 
@@ -49,6 +53,9 @@ static void rg55g1_log_dump_ringbuffer(void);
 static bool rg55g1_log_ensure_port(void);
 static int rg55g1_log_port_setup(struct usb_serial_port *port);
 static struct usb_serial_port *rg55g1_log_find_port(void);
+static void rg55g1_log_clear_port(void);
+static void rg55g1_log_reattach_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(rg55g1_log_reattach_work, rg55g1_log_reattach_fn);
 
 static void rg55g1_log_wait_tx(struct usb_serial_port *port)
 {
@@ -143,18 +150,41 @@ static void rg55g1_log_port_write(const char *buf, unsigned int count)
 	rg55g1_log_port_xmit(buf, count, false);
 }
 
+static void rg55g1_log_clear_port(void)
+{
+	mutex_lock(&rg55g1_log_lock);
+	if (rg55g1_log_port) {
+		rg55g1_log_port->port.console = 0;
+		rg55g1_log_port = NULL;
+	}
+	mutex_unlock(&rg55g1_log_lock);
+}
+
 static bool rg55g1_log_ensure_port(void)
 {
 	struct usb_serial_port *port;
 	int ret, i;
 
-	if (rg55g1_log_port)
-		return true;
+	for (i = 0; i < 30; i++) {
+		mutex_lock(&rg55g1_log_lock);
+		if (rg55g1_log_port) {
+			mutex_unlock(&rg55g1_log_lock);
+			return true;
+		}
+		mutex_unlock(&rg55g1_log_lock);
 
-	for (i = 0; i < 120; i++) {
 		port = rg55g1_log_find_port();
 		if (port) {
+			mutex_lock(&rg55g1_log_lock);
+			if (rg55g1_log_port) {
+				/* Another caller won the race. */
+				mutex_unlock(&port->serial->disc_mutex);
+				usb_serial_put(port->serial);
+				mutex_unlock(&rg55g1_log_lock);
+				return true;
+			}
 			ret = rg55g1_log_port_setup(port);
+			mutex_unlock(&rg55g1_log_lock);
 			if (!ret)
 				return true;
 			pr_emerg("rg55g1: log export port setup failed: %d\n", ret);
@@ -186,29 +216,42 @@ static void rg55g1_log_dump_ringbuffer(void)
 void rg55g1_log_export_flush(void)
 {
 	static const char banner[] =
-		"\n*** rg55g1 full dmesg -> ttyUSB (115200 8N1) ***\n";
+		"\n*** rg55g1 ttyUSB console live (115200 8N1) ***\n";
+	static bool once;
 
 	if (!rg55g1_log_usb)
 		return;
 
-	if (!rg55g1_log_ensure_port()) {
-		pr_emerg("rg55g1: log flush: no ttyUSB\n");
-		return;
+	/* One try — never sleep in the boot/initcall path. */
+	if (!rg55g1_log_port) {
+		struct usb_serial_port *port = rg55g1_log_find_port();
+
+		if (!port) {
+			pr_emerg_once("rg55g1: log flush: no ttyUSB yet\n");
+			return;
+		}
+		mutex_lock(&rg55g1_log_lock);
+		if (!rg55g1_log_port) {
+			if (rg55g1_log_port_setup(port)) {
+				mutex_unlock(&rg55g1_log_lock);
+				return;
+			}
+		} else {
+			mutex_unlock(&port->serial->disc_mutex);
+			usb_serial_put(port->serial);
+		}
+		mutex_unlock(&rg55g1_log_lock);
 	}
 
-	if (!rg55g1_log_console_registered)
-		pr_emerg("rg55g1: flushing full dmesg to ttyUSB%d\n",
-			 rg55g1_log_port->minor);
-	rg55g1_log_port_write_sync(banner, sizeof(banner) - 1);
-	rg55g1_log_dump_ringbuffer();
 	if (!rg55g1_log_console_registered)
 		rg55g1_log_register_console();
-	{
-		static const char done[] =
-			"\n*** rg55g1 dmesg flush done, console live ***\n";
 
-		rg55g1_log_port_write_sync(done, sizeof(done) - 1);
-	}
+	if (once)
+		return;
+	once = true;
+
+	pr_emerg("rg55g1: ttyUSB%d console live\n", rg55g1_log_port->minor);
+	rg55g1_log_port_write_sync(banner, sizeof(banner) - 1);
 }
 EXPORT_SYMBOL_GPL(rg55g1_log_export_flush);
 
@@ -338,13 +381,32 @@ static bool rg55g1_log_ch340_device(struct usb_device *udev)
 		udev->descriptor.idProduct == 0x5523);
 }
 
+static void rg55g1_log_reattach_fn(struct work_struct *work)
+{
+	if (!rg55g1_log_usb)
+		return;
+
+	/* Port may have appeared after VBUS; dump ring + enable live console. */
+	rg55g1_log_export_flush();
+}
+
 static int rg55g1_log_usb_notify(struct notifier_block *nb,
 				   unsigned long action, void *data)
 {
 	struct usb_device *udev = data;
 
-	if (action == USB_DEVICE_ADD && rg55g1_log_ch340_device(udev))
+	if (!rg55g1_log_ch340_device(udev))
+		return NOTIFY_OK;
+
+	if (action == USB_DEVICE_ADD) {
 		atomic_set(&rg55g1_log_usb_seen, 1);
+		/* CH340 may appear after VBUS; dump + live console then. */
+		schedule_delayed_work(&rg55g1_log_reattach_work,
+				      msecs_to_jiffies(500));
+	} else if (action == USB_DEVICE_REMOVE) {
+		cancel_delayed_work(&rg55g1_log_reattach_work);
+		rg55g1_log_clear_port();
+	}
 	return NOTIFY_OK;
 }
 
@@ -380,22 +442,52 @@ EXPORT_SYMBOL_GPL(rg55g1_usb_serial_bringup);
 static int rg55g1_log_export_thread(void *unused)
 {
 	static const char ready[] =
-		"\n*** rg55g1 ttyUSB log (115200) — full dump ~20s ***\n";
+		"\n*** rg55g1 ttyUSB live console (115200) ***\n";
+	static const char dump_banner[] =
+		"\n*** rg55g1 full dmesg dump (async, boot continues) ***\n";
+	static const char dump_done[] =
+		"\n*** dmesg dump done — watching for /init ***\n";
+	unsigned long last_hb = 0;
 
-	if (!rg55g1_log_ensure_port()) {
-		pr_emerg("rg55g1: log export: no ttyUSB (ch341=%d seen=%d)\n",
-			 IS_ENABLED(CONFIG_USB_SERIAL_CH341),
-			 atomic_read(&rg55g1_log_usb_seen));
-		return 0;
+	/* Keep retrying — LV6 may bring CH340 up after VBUS settle. */
+	while (!kthread_should_stop()) {
+		if (rg55g1_log_ensure_port())
+			break;
+		pr_emerg_once("rg55g1: log export waiting for ttyUSB (ch341=%d)\n",
+			      IS_ENABLED(CONFIG_USB_SERIAL_CH341));
+		schedule_timeout_interruptible(msecs_to_jiffies(1000));
 	}
+
+	if (kthread_should_stop() || !rg55g1_log_port)
+		return 0;
 
 	rg55g1_log_port_write_sync(ready, sizeof(ready) - 1);
 	rg55g1_log_register_console();
-	rg55g1_log_port_write_sync(
-		"rg55g1: ttyUSB live console ready\n", 35);
+	pr_emerg("rg55g1: ttyUSB console registered — dumping ringbuffer async\n");
 
-	while (!kthread_should_stop())
+	/*
+	 * Full history dump in THIS kthread only. Never do it from initcalls —
+	 * 115200 TX of a large ring buffer blocked entering /init for minutes.
+	 */
+	rg55g1_log_port_write_sync(dump_banner, sizeof(dump_banner) - 1);
+	rg55g1_log_dump_ringbuffer();
+	rg55g1_log_port_write_sync(dump_done, sizeof(dump_done) - 1);
+
+	while (!kthread_should_stop()) {
+		/* Heartbeat proves the system is not hard-locked. */
+		if (time_after(jiffies, last_hb + 5 * HZ)) {
+			char hb[64];
+			int n;
+
+			last_hb = jiffies;
+			n = snprintf(hb, sizeof(hb),
+				     "rg55g1: heartbeat jiffies=%lu\n", jiffies);
+			if (n > 0)
+				rg55g1_log_port_write_sync(hb, n);
+			pr_emerg("rg55g1: heartbeat (boot progress)\n");
+		}
 		schedule_timeout_interruptible(msecs_to_jiffies(1000));
+	}
 
 	if (rg55g1_log_console_registered) {
 		console_lock();
@@ -411,7 +503,7 @@ void rg55g1_log_export_start(void)
 {
 	int ret;
 
-	if (!rg55g1_log_usb || rg55g1_log_task)
+	if (!rg55g1_log_usb)
 		return;
 
 #if !IS_ENABLED(CONFIG_USB_SERIAL)
@@ -419,13 +511,16 @@ void rg55g1_log_export_start(void)
 	return;
 #endif
 
-	pr_emerg("rg55g1: log export thread starting (ch341=%s)\n",
-		 IS_ENABLED(CONFIG_USB_SERIAL_CH341) ? "y" : "n");
-
 	if (!rg55g1_log_usb_nb.notifier_call) {
 		rg55g1_log_usb_nb.notifier_call = rg55g1_log_usb_notify;
 		usb_register_notify(&rg55g1_log_usb_nb);
 	}
+
+	if (rg55g1_log_task)
+		return;
+
+	pr_emerg("rg55g1: log export thread starting (ch341=%s)\n",
+		 IS_ENABLED(CONFIG_USB_SERIAL_CH341) ? "y" : "n");
 
 	rg55g1_log_task = kthread_run(rg55g1_log_export_thread, NULL,
 				      "rg55g1-log");
@@ -433,7 +528,11 @@ void rg55g1_log_export_start(void)
 		ret = PTR_ERR(rg55g1_log_task);
 		rg55g1_log_task = NULL;
 		pr_emerg("rg55g1: log export kthread failed: %d\n", ret);
+		return;
 	}
+
+	/* Catch CH340 that enumerated before our USB notifier was registered. */
+	schedule_delayed_work(&rg55g1_log_reattach_work, msecs_to_jiffies(2000));
 }
 EXPORT_SYMBOL_GPL(rg55g1_log_export_start);
 
@@ -449,3 +548,10 @@ static int __init rg55g1_log_usb_setup(char *str)
 	return 0;
 }
 early_param("rg55g1.log_usb", rg55g1_log_usb_setup);
+
+static int __init rg55g1_boot_marker_late(void)
+{
+	pr_emerg("rg55g1: late_initcall done — next is Freeing init / /init\n");
+	return 0;
+}
+late_initcall_sync(rg55g1_boot_marker_late);

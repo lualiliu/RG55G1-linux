@@ -31,6 +31,7 @@ extern bool rg55g1_abl_panel_ready;
 
 /* Keep ABL continuous splash / GDSC during first attach (cleared after quiesce). */
 extern bool rg55g1_preserve_abl_display;
+void rg55g1_dispcc_quiesce_splash(void);
 
 /* Skip MDSS hardware reset while attaching during bring-up. */
 extern bool rg55g1_skip_mdss_reset;
