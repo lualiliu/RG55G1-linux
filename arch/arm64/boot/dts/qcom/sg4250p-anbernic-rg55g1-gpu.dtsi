@@ -1,0 +1,169 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * RG55G1 Adreno 613 GPU (SM4450 / Ravelin).
+ *
+ * Adapted from ROCKNIX sm4450-retroid-pocket-classic.dts GPU block.
+ * Interconnects omitted: gem_noc/mc_virt stay disabled until RPMh AMC is
+ * reliable (pd_ignore_unused / clk_ignore_unused cover bandwidth votes).
+ */
+#include <dt-bindings/clock/qcom,sm4450-gcc.h>
+#include <dt-bindings/clock/qcom,sm4450-gpucc.h>
+#include <dt-bindings/power/qcom,rpmhpd.h>
+
+&soc {
+	qfprom: qfprom@221c8000 {
+		compatible = "qcom,sm4450-qfprom", "qcom,qfprom";
+		reg = <0x0 0x221c8000 0x0 0x1000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		read-only;
+
+		gpu_speed_bin: gpu-speed-bin@119 {
+			reg = <0x119 0x2>;
+			bits = <5 8>;
+		};
+	};
+
+	gpu: gpu@3d00000 {
+		compatible = "qcom,adreno-613.0", "qcom,adreno";
+		reg = <0x0 0x03d00000 0x0 0x40000>,
+		      <0x0 0x03d9e000 0x0 0x1000>,
+		      <0x0 0x03d61000 0x0 0x800>;
+		reg-names = "kgsl_3d0_reg_memory",
+			    "cx_mem",
+			    "cx_dbgc";
+
+		interrupts = <GIC_SPI 300 IRQ_TYPE_LEVEL_HIGH>;
+
+		clocks = <&gpucc GPU_CC_GX_GFX3D_CLK>,
+			 <&gpucc GPU_CC_AHB_CLK>,
+			 <&gcc GCC_DDRSS_GPU_AXI_CLK>,
+			 <&gcc GCC_GPU_MEMNOC_GFX_CLK>,
+			 <&gpucc GPU_CC_CX_GMU_CLK>,
+			 <&gpucc GPU_CC_CXO_CLK>,
+			 <&gpucc GPU_CC_HUB_CX_INT_CLK>;
+		clock-names = "core",
+			      "iface",
+			      "mem_iface",
+			      "alt_mem_iface",
+			      "gmu",
+			      "xo",
+			      "hub";
+
+		iommus = <&adreno_smmu 0 0x400>;
+		/* CX already on; rpmhpd vote times out during MSM handoff. */
+
+		operating-points-v2 = <&gpu_opp_table>;
+
+		qcom,gmu = <&gmu_wrapper>;
+
+		nvmem-cells = <&gpu_speed_bin>;
+		nvmem-cell-names = "speed_bin";
+
+		#cooling-cells = <2>;
+
+		/*
+		 * Probe after rg55g1 MSM/GPU handoff enables gpucc — early
+		 * OF probe races rpmhpd and leaves the GPU stuck deferred.
+		 */
+		status = "disabled";
+
+		zap-shader {
+			memory-region = <&gpu_microcode_mem>;
+			firmware-name = "qcom/sm4450/a613_zap.mbn";
+		};
+
+		gpu_opp_table: opp-table {
+			compatible = "operating-points-v2";
+
+			/*
+			 * No opp-peak-kBps: gem_noc/mc_virt are disabled (RPMh),
+			 * so interconnect paths=0 and OPP add fails with -EINVAL.
+			 * No required-opps: rpmhpd votes also time out on this board.
+			 */
+			opp-340000000 {
+				opp-hz = /bits/ 64 <340000000>;
+				opp-supported-hw = <0xf>;
+			};
+
+			opp-500000000 {
+				opp-hz = /bits/ 64 <500000000>;
+				opp-supported-hw = <0xf>;
+			};
+
+			opp-605000000 {
+				opp-hz = /bits/ 64 <605000000>;
+				opp-supported-hw = <0xf>;
+			};
+
+			opp-765000000 {
+				opp-hz = /bits/ 64 <765000000>;
+				opp-supported-hw = <0xf>;
+			};
+
+			opp-850000000 {
+				opp-hz = /bits/ 64 <850000000>;
+				opp-supported-hw = <0x7>;
+			};
+
+			opp-955000000 {
+				opp-hz = /bits/ 64 <955000000>;
+				opp-supported-hw = <0x7>;
+			};
+
+			opp-1010000000 {
+				opp-hz = /bits/ 64 <1010000000>;
+				opp-supported-hw = <0x5>;
+			};
+		};
+	};
+
+	gmu_wrapper: gmu@3d6a000 {
+		compatible = "qcom,adreno-gmu-wrapper";
+		reg = <0x0 0x03d6a000 0x0 0x30000>;
+		reg-names = "gmu";
+		power-domains = <&gpucc GPU_CC_CX_GDSC>,
+				<&gpucc GPU_CC_GX_GDSC>;
+		power-domain-names = "cx", "gx";
+		status = "disabled";
+	};
+
+	adreno_smmu: iommu@3da0000 {
+		compatible = "qcom,sm4450-smmu-500", "qcom,adreno-smmu",
+			     "qcom,smmu-500", "arm,mmu-500";
+		/* HW ID reports 64KB; larger map triggers arm-smmu WARN. */
+		reg = <0x0 0x03da0000 0x0 0x10000>;
+		#iommu-cells = <2>;
+		#global-interrupts = <1>;
+		dma-coherent;
+		interrupts = <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 678 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 679 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 680 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 681 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 682 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 683 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 684 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 685 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 686 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 687 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 688 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 422 IRQ_TYPE_LEVEL_HIGH>;
+
+		clocks = <&gpucc GPU_CC_CX_GMU_CLK>,
+			 <&gpucc GPU_CC_HUB_CX_INT_CLK>,
+			 <&gpucc GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK>,
+			 <&gcc GCC_GPU_MEMNOC_GFX_CLK>,
+			 <&gcc GCC_GPU_SNOC_DVM_GFX_CLK>,
+			 <&gpucc GPU_CC_AHB_CLK>;
+		clock-names = "gmu",
+			      "hub",
+			      "hlos",
+			      "bus",
+			      "iface",
+			      "ahb";
+
+		power-domains = <&gpucc GPU_CC_CX_GDSC>;
+		status = "disabled";
+	};
+};

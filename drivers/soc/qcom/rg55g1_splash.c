@@ -121,6 +121,45 @@ static void rg55_sync_hw(void *hw, u32 y, u32 h)
 	dcache_clean_poc((unsigned long)start, (unsigned long)start + len);
 }
 
+void rg55g1_splash_blit_rgb32(const void *src, unsigned int src_pitch,
+			      unsigned int x1, unsigned int y1,
+			      unsigned int x2, unsigned int y2)
+{
+	const u8 *sbase = src;
+	u8 *dst = rg55g1_splash_hw;
+	const unsigned int dst_pitch = RG55_FB_W * 4;
+	unsigned int y, w, h;
+
+	if (!sbase || !dst || x1 >= x2 || y1 >= y2)
+		return;
+	if (x1 >= RG55_FB_W || y1 >= RG55_FB_H)
+		return;
+	if (x2 > RG55_FB_W)
+		x2 = RG55_FB_W;
+	if (y2 > RG55_FB_H)
+		y2 = RG55_FB_H;
+	if (!src_pitch)
+		src_pitch = dst_pitch;
+
+	w = x2 - x1;
+	h = y2 - y1;
+
+	/* Already drawing into splash — just clean the cache for DPU. */
+	if (sbase == dst) {
+		rg55_sync_hw(dst, y1, h);
+		return;
+	}
+
+	for (y = 0; y < h; y++) {
+		const u8 *s = sbase + (size_t)(y1 + y) * src_pitch + (size_t)x1 * 4;
+		u8 *d = dst + (size_t)(y1 + y) * dst_pitch + (size_t)x1 * 4;
+
+		memcpy(d, s, (size_t)w * 4);
+	}
+	rg55_sync_hw(dst, y1, h);
+}
+EXPORT_SYMBOL_GPL(rg55g1_splash_blit_rgb32);
+
 static void rg55_flush_tile(struct fb_info *info, u32 dx, u32 dy,
 			    u32 width, u32 height)
 {
@@ -467,6 +506,35 @@ void rg55g1_mark(u32 y, u32 color)
 }
 EXPORT_SYMBOL_GPL(rg55g1_mark);
 
+void rg55g1_splash_paint_alive(const char *tag)
+{
+	void *hw = rg55g1_splash_hw;
+	u32 line = RG55_FB_W * 4;
+	u32 y, x;
+	u32 *row;
+
+	if (!hw)
+		return;
+
+	/* Magenta top / cyan bottom borders — unmistakable if scanout lives. */
+	rg55_hw_bar(hw, 0, 48, 0x00ff00ff);
+	rg55_hw_bar(hw, RG55_FB_H - 48, 48, 0x0000ffff);
+
+	for (y = 48; y < 96; y++) {
+		row = (u32 *)((u8 *)hw + (size_t)y * line);
+		for (x = 0; x < 64; x++)
+			row[x] = 0x0000ff00; /* green left */
+		for (x = RG55_FB_W - 64; x < RG55_FB_W; x++)
+			row[x] = 0x00ff0000; /* red right */
+	}
+	rg55_sync_hw(hw, 0, 96);
+	rg55_sync_hw(hw, RG55_FB_H - 48, 48);
+
+	rg55_status_slot = 0;
+	rg55g1_status(tag ? tag : "ALIVE", 0x00ffff00);
+}
+EXPORT_SYMBOL_GPL(rg55g1_splash_paint_alive);
+
 static struct fb_info *rg55g1_pending_fb;
 
 static int __init rg55g1_splash_console_init(void)
@@ -542,16 +610,13 @@ static int __init rg55g1_splash_console_init(void)
 	rg55g1_splash_hw = hw;
 	rg55g1_splash_info = info;
 
-	{
-		u32 y, x;
-
-		rg55_hw_bar(hw, 0, RG55_STATUS_H, 0x00202020);
-		rg55_sync_hw(hw, 0, RG55_STATUS_H);
-		for (y = 0; y < RG55_CON_H; y += 8) {
-			for (x = 0; x < RG55_FB_W; x += 64)
-				rg55_flush_tile(info, x, y, 64, 8);
-		}
-	}
+	/*
+	 * Do NOT copy the zeroed shadow over splash RAM — that wipes the ABL
+	 * logo and leaves a black panel. Only paint the status strip; leave
+	 * the rest of 0xb8000000 alone for continuous splash scanout.
+	 */
+	rg55_hw_bar(hw, 0, RG55_STATUS_H, 0x00202020);
+	rg55_sync_hw(hw, 0, RG55_STATUS_H);
 
 	rg55_status_slot = 0;
 	rg55g1_status("FB-MAP", 0x00404040);

@@ -24,6 +24,7 @@
 		resets = <&dispcc DISP_CC_MDSS_CORE_BCR>;
 		power-domains = <&dispcc DISP_CC_MDSS_CORE_GDSC>;
 
+		/* ROCKNIX: MDSS SID 0x800 — clean KMS after INTF quiesce. */
 		iommus = <&apps_smmu 0x800 0x402>;
 
 		#address-cells = <2>;
@@ -53,7 +54,7 @@
 			assigned-clock-rates = <19200000>;
 
 			operating-points-v2 = <&mdp_opp_table>;
-			power-domains = <&rpmhpd RPMHPD_CX>;
+			/* CX already on from ABL; rpmhpd vote times out on this board. */
 
 			interrupt-parent = <&mdss>;
 			interrupts = <0>;
@@ -73,29 +74,25 @@
 			mdp_opp_table: opp-table {
 				compatible = "operating-points-v2";
 
+				/* No required-opps — rpmhpd votes time out on RG55G1. */
 				opp-200000000 {
 					opp-hz = /bits/ 64 <200000000>;
-					required-opps = <&rpmhpd_opp_low_svs>;
 				};
 
 				opp-325000000 {
 					opp-hz = /bits/ 64 <325000000>;
-					required-opps = <&rpmhpd_opp_svs>;
 				};
 
 				opp-380000000 {
 					opp-hz = /bits/ 64 <380000000>;
-					required-opps = <&rpmhpd_opp_svs_l1>;
 				};
 
 				opp-506000000 {
 					opp-hz = /bits/ 64 <506000000>;
-					required-opps = <&rpmhpd_opp_nom>;
 				};
 
 				opp-608000000 {
 					opp-hz = /bits/ 64 <608000000>;
-					required-opps = <&rpmhpd_opp_turbo>;
 				};
 			};
 		};
@@ -108,31 +105,39 @@
 			interrupt-parent = <&mdss>;
 			interrupts = <4>;
 
+			/*
+			 * SM4450 uses 6G v2.9 ops (runtime BYTE/PCLK reparent
+			 * after phy_enable). Needs *_src + dsi_pll_* clocks —
+			 * assigned-clock-parents alone is not enough.
+			 */
 			clocks = <&dispcc DISP_CC_MDSS_BYTE0_CLK>,
 				 <&dispcc DISP_CC_MDSS_BYTE0_INTF_CLK>,
 				 <&dispcc DISP_CC_MDSS_PCLK0_CLK>,
 				 <&dispcc DISP_CC_MDSS_ESC0_CLK>,
 				 <&dispcc DISP_CC_MDSS_AHB_CLK>,
-				 <&gcc GCC_DISP_HF_AXI_CLK>;
+				 <&gcc GCC_DISP_HF_AXI_CLK>,
+				 <&dispcc DISP_CC_MDSS_BYTE0_CLK_SRC>,
+				 <&dispcc DISP_CC_MDSS_PCLK0_CLK_SRC>,
+				 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+				 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
 			clock-names = "byte",
 				      "byte_intf",
 				      "pixel",
 				      "core",
 				      "iface",
-				      "bus";
-
-			assigned-clocks = <&dispcc DISP_CC_MDSS_BYTE0_CLK_SRC>,
-					  <&dispcc DISP_CC_MDSS_PCLK0_CLK_SRC>;
-			assigned-clock-parents = <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
-						 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
+				      "bus",
+				      "byte_src",
+				      "pixel_src",
+				      "dsi_pll_byte",
+				      "dsi_pll_pixel";
 
 			operating-points-v2 = <&mdss_dsi_opp_table>;
-			power-domains = <&rpmhpd RPMHPD_CX>;
+			/* CX already on; rpmhpd vote times out on this board. */
 
 			phys = <&mdss_dsi0_phy>;
 			phy-names = "dsi";
 
-			vdda-supply = <&vreg_l16b_1p2>;
+			vdda-supply = <&reg_dsi_vdda>;
 
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -160,19 +165,17 @@
 			mdss_dsi_opp_table: opp-table {
 				compatible = "operating-points-v2";
 
+				/* No required-opps — rpmhpd votes time out on RG55G1. */
 				opp-187500000 {
 					opp-hz = /bits/ 64 <187500000>;
-					required-opps = <&rpmhpd_opp_low_svs>;
 				};
 
 				opp-300000000 {
 					opp-hz = /bits/ 64 <300000000>;
-					required-opps = <&rpmhpd_opp_svs>;
 				};
 
 				opp-358000000 {
 					opp-hz = /bits/ 64 <358000000>;
-					required-opps = <&rpmhpd_opp_svs_l1>;
 				};
 			};
 
@@ -206,7 +209,7 @@
 				 <&rpmhcc RPMH_CXO_CLK>;
 			clock-names = "iface", "ref";
 
-			vdds-supply = <&vreg_l5b_0p88>;
+			vdds-supply = <&reg_dsi_phy_vdds>;
 		};
 	};
 };

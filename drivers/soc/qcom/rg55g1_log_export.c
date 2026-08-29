@@ -447,7 +447,6 @@ static int rg55g1_log_export_thread(void *unused)
 		"\n*** rg55g1 full dmesg dump (async, boot continues) ***\n";
 	static const char dump_done[] =
 		"\n*** dmesg dump done — watching for /init ***\n";
-	unsigned long last_hb = 0;
 
 	/* Keep retrying — LV6 may bring CH340 up after VBUS settle. */
 	while (!kthread_should_stop()) {
@@ -473,21 +472,8 @@ static int rg55g1_log_export_thread(void *unused)
 	rg55g1_log_dump_ringbuffer();
 	rg55g1_log_port_write_sync(dump_done, sizeof(dump_done) - 1);
 
-	while (!kthread_should_stop()) {
-		/* Heartbeat proves the system is not hard-locked. */
-		if (time_after(jiffies, last_hb + 5 * HZ)) {
-			char hb[64];
-			int n;
-
-			last_hb = jiffies;
-			n = snprintf(hb, sizeof(hb),
-				     "rg55g1: heartbeat jiffies=%lu\n", jiffies);
-			if (n > 0)
-				rg55g1_log_port_write_sync(hb, n);
-			pr_emerg("rg55g1: heartbeat (boot progress)\n");
-		}
+	while (!kthread_should_stop())
 		schedule_timeout_interruptible(msecs_to_jiffies(1000));
-	}
 
 	if (rg55g1_log_console_registered) {
 		console_lock();

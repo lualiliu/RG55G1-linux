@@ -42,6 +42,9 @@ bool rg55g1_msm_auto;
 bool rg55g1_preserve_abl_display = true;
 EXPORT_SYMBOL_GPL(rg55g1_preserve_abl_display);
 
+bool rg55g1_kms_scanout_ok;
+EXPORT_SYMBOL_GPL(rg55g1_kms_scanout_ok);
+
 bool rg55g1_abl_panel_ready = true;
 EXPORT_SYMBOL_GPL(rg55g1_abl_panel_ready);
 /* Default on: OF must not reset/populate MDSS while ABL splash is scanning. */
@@ -157,6 +160,7 @@ static bool rg55g1_is_display_node(struct device_node *np)
 {
 	return of_device_is_compatible(np, "qcom,ravelin-dispcc") ||
 	       of_device_is_compatible(np, "qcom,sm4450-dispcc") ||
+	       of_device_is_compatible(np, "qcom,sm4450-gpucc") ||
 	       of_device_is_compatible(np, "qcom,ravelin-mdss") ||
 	       of_device_is_compatible(np, "qcom,sm4450-mdss") ||
 	       of_device_is_compatible(np, "qcom,mdss") ||
@@ -166,7 +170,10 @@ static bool rg55g1_is_display_node(struct device_node *np)
 	       of_device_is_compatible(np, "qcom,mdss-dsi-ctrl") ||
 	       of_device_is_compatible(np, "qcom,sm4450-dsi-phy-4nm") ||
 	       of_device_is_compatible(np, "qcom,ravelin-dsi-phy-4nm") ||
-	       of_device_is_compatible(np, "focaltech,ft7131m");
+	       of_device_is_compatible(np, "focaltech,ft7131m") ||
+	       of_device_is_compatible(np, "qcom,adreno") ||
+	       of_device_is_compatible(np, "qcom,adreno-613.0") ||
+	       of_device_is_compatible(np, "qcom,adreno-gmu-wrapper");
 }
 
 static bool rg55g1_is_smem_keep(struct device_node *np)
@@ -350,6 +357,12 @@ static void rg55g1_remove_prop(struct device_node *np, const char *name)
 	if (pp)
 		of_remove_property(np, pp);
 }
+
+void rg55g1_dt_remove_prop(struct device_node *np, const char *name)
+{
+	rg55g1_remove_prop(np, name);
+}
+EXPORT_SYMBOL_GPL(rg55g1_dt_remove_prop);
 
 static void rg55g1_set_u32_prop(struct device_node *np, const char *name, u32 v)
 {
@@ -2354,8 +2367,9 @@ static int rg55g1_bringup_apps_smmu(void)
 		return ret;
 	}
 	/*
-	 * Do not rewrite MDSS SID 0x800 if ABL already programmed it — touching
-	 * a live display SMR can hang the bus. Only install when unmatched.
+	 * MDSS SID 0x800: if ABL still owns it, leave alone (rewriting a live
+	 * display SMR can hang). If missing (e.g. prior arm-smmu reset), install
+	 * bypass so splash phys DMA works again.
 	 */
 	{
 		bool mdss_present = false;
@@ -2371,12 +2385,12 @@ static int rg55g1_bringup_apps_smmu(void)
 			mask = (smr >> 16) & 0x7fff;
 			if ((0x800 & ~mask) == (id & ~mask)) {
 				mdss_present = true;
+				pr_emerg("rg55g1: MDSS SID SMR[%u]=0x%x — leave alone\n",
+					 i, smr);
 				break;
 			}
 		}
-		if (mdss_present)
-			pr_emerg("rg55g1: MDSS SID already programmed — leave alone\n");
-		else {
+		if (!mdss_present) {
 			ret = rg55g1_smmu_install_exact(smmu, numsmr, 0x800,
 							want_s2cr, "MDSS");
 			if (ret < 0)
@@ -2390,6 +2404,64 @@ static int rg55g1_bringup_apps_smmu(void)
 	iounmap(smmu);
 	return 0;
 }
+
+/**
+ * rg55g1_ensure_mdss_smmu_bypass() - reinstall MDSS SID bypass if missing.
+ * Called at MSM fbdev handoff so splash scanout can see 0xb8000000.
+ */
+int rg55g1_ensure_mdss_smmu_bypass(void)
+{
+	void __iomem *smmu;
+	u32 id0, id1, want_s2cr, cbndx = 0, numsmr;
+	unsigned int i;
+	int ret = 0;
+
+	smmu = ioremap(0x15000000, 0x100000);
+	if (!smmu)
+		return -ENOMEM;
+
+	id0 = readl_relaxed(smmu + 0x20);
+	id1 = readl_relaxed(smmu + 0x24);
+	if (id0 == 0 || id0 == ~0u) {
+		iounmap(smmu);
+		return -EIO;
+	}
+	if (!rg55g1_smmu_bypass_cb(smmu, id1, &cbndx)) {
+		iounmap(smmu);
+		return -EPERM;
+	}
+
+	numsmr = id0 & 0xff;
+	if (!numsmr || numsmr > 256)
+		numsmr = 128;
+
+	want_s2cr = FIELD_PREP(GENMASK(17, 16), 0) |
+		    FIELD_PREP(GENMASK(7, 0), cbndx);
+
+	for (i = 0; i < numsmr; i++) {
+		u32 smr = readl_relaxed(smmu + 0x800 + (i << 2));
+		u32 id, mask;
+
+		if (!(smr & BIT(31)))
+			continue;
+		id = smr & 0xffff;
+		mask = (smr >> 16) & 0x7fff;
+		if ((0x800 & ~mask) == (id & ~mask)) {
+			u32 s2cr = readl_relaxed(smmu + 0xc00 + (i << 2));
+
+			pr_emerg("rg55g1: handoff MDSS SMR[%u]=0x%x s2cr=0x%x\n",
+				 i, smr, s2cr);
+			iounmap(smmu);
+			return 0;
+		}
+	}
+
+	pr_emerg("rg55g1: handoff MDSS SID missing — installing bypass\n");
+	ret = rg55g1_smmu_install_exact(smmu, numsmr, 0x800, want_s2cr, "MDSS");
+	iounmap(smmu);
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(rg55g1_ensure_mdss_smmu_bypass);
 
 /**
  * rg55g1_bringup_mmc() - create SDHCI platform devices after GCC is up.

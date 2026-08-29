@@ -13,6 +13,17 @@ void rg55g1_status_vbus(const char *msg, u32 color);
 void rg55g1_status_batt(const char *msg, u32 color);
 void rg55g1_mark(u32 y, u32 color);
 
+/*
+ * Copy a 32bpp RGB rect into ABL scanout (0xb8000000). Used when MSM KMS
+ * cannot reprogram SSPP (CTL_FLUSH stuck) but INTF still scans splash RAM.
+ */
+void rg55g1_splash_blit_rgb32(const void *src, unsigned int src_pitch,
+			      unsigned int x1, unsigned int y1,
+			      unsigned int x2, unsigned int y2);
+
+/* Bright border + status so we can tell if ABL scanout is still alive. */
+void rg55g1_splash_paint_alive(const char *tag);
+
 int __init rg55g1_splash_fbdev_bringup(void);
 
 #endif

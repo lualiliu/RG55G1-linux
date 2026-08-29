@@ -32,6 +32,7 @@
 
 /* RG55G1 ABL continuous splash — avoid reprogramming live INTF/DSI. */
 extern bool rg55g1_preserve_abl_display;
+extern bool rg55g1_kms_scanout_ok;
 
 static inline bool dpu_rg55g1_abl_keepalive(void)
 {
@@ -340,6 +341,21 @@ static void dpu_encoder_phys_vid_setup_timing_engine(
 	programmable_fetch_config(phys_enc, &timing_params);
 }
 
+/*
+ * ABL continuous splash already owns CTL/SSPP/LM/INTF. Any MMIO touch here
+ * (bind_pingpong, FETCH/PIPE/LAYER_ACTIVE) desyncs the running pipeline and
+ * blacks the panel while CTL_FLUSH stays stuck. Leave HW alone until a real
+ * takeover path lands.
+ */
+static void dpu_encoder_phys_vid_abl_reconnect_ctl(struct dpu_encoder_phys *phys_enc)
+{
+	if (!phys_enc->hw_intf)
+		return;
+
+	pr_emerg("dpu: ABL keepalive INTF%u (no CTL reconnect)\n",
+		 phys_enc->hw_intf->idx - INTF_0);
+}
+
 static void dpu_encoder_phys_vid_vblank_irq(void *arg)
 {
 	struct dpu_encoder_phys *phys_enc = arg;
@@ -470,19 +486,20 @@ static void dpu_encoder_phys_vid_enable(struct dpu_encoder_phys *phys_enc)
 		return;
 
 	/*
-	 * ABL continuous splash: INTF timing is already running. Reprogramming
-	 * setup_timing_gen / flushing INTF leaves CTL_FLUSH BIT(31) stuck
-	 * ("vblank timeout: 8002xxxx"). Keep the live timing engine.
+	 * ABL continuous splash: INTF timing is already running. Touch nothing
+	 * — even setup_split_pipe / CDM can desync the live pipeline.
 	 */
 	if (dpu_rg55g1_abl_keepalive() &&
 	    phys_enc->hw_intf->ops.get_status) {
 		phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf, &intf_status);
 		if (intf_status.is_en) {
-			pr_emerg("dpu: vid_enable ABL keep INTF timing (skip reconfig)\n");
+			dpu_encoder_phys_vid_abl_reconnect_ctl(phys_enc);
 			atomic_set(&phys_enc->underrun_cnt, 0);
 			phys_enc->enable_state = DPU_ENC_ENABLED;
 			return;
 		}
+		pr_emerg("dpu: ABL keepalive but INTF%u not enabled (is_en=0)\n",
+			 phys_enc->hw_intf->idx - INTF_0);
 	}
 
 	dpu_encoder_helper_split_config(phys_enc, phys_enc->hw_intf->idx);
@@ -564,21 +581,20 @@ static int dpu_encoder_phys_vid_wait_for_commit_done(
 	if (!hw_ctl)
 		return 0;
 
+	/*
+	 * ABL continuous splash: we intentionally skip CTL_FLUSH kickoff, so
+	 * waiting on the flush register only burns time and falsely promotes
+	 * rg55g1_kms_scanout_ok when the register happens to already be 0.
+	 */
+	if (dpu_rg55g1_abl_keepalive() && !rg55g1_kms_scanout_ok)
+		return 0;
+
 	ret = wait_event_timeout(phys_enc->pending_kickoff_wq,
 		(hw_ctl->ops.get_flush_register(hw_ctl) == 0),
 		msecs_to_jiffies(50));
 	if (ret <= 0) {
 		flush = hw_ctl->ops.get_flush_register(hw_ctl);
 		DPU_ERROR("vblank timeout: %x\n", flush);
-		/*
-		 * During ABL continuous-splash takeover the flush register may
-		 * not clear (wrong CTL ownership / skipped INTF rebind). Do not
-		 * fail the commit — allow fbdev/KMS to finish bring-up.
-		 */
-		if (dpu_rg55g1_abl_keepalive()) {
-			pr_emerg("dpu: ABL ignore flush timeout %x\n", flush);
-			return 0;
-		}
 		return -ETIMEDOUT;
 	}
 
@@ -606,7 +622,8 @@ static void dpu_encoder_phys_vid_prepare_for_kickoff(
 	if (rc) {
 		DPU_ERROR_VIDENC(phys_enc, "ctl %d reset failure: %d\n",
 				ctl->idx, rc);
-		msm_disp_snapshot_state(drm_enc->dev);
+		if (!dpu_rg55g1_abl_keepalive())
+			msm_disp_snapshot_state(drm_enc->dev);
 		dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
 				phys_enc->irq[INTR_IDX_VSYNC]);
 	}
@@ -634,6 +651,16 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
 
 	if (phys_enc->enable_state == DPU_ENC_DISABLED) {
 		DPU_ERROR("already disabled\n");
+		return;
+	}
+
+	/*
+	 * Never stop live ABL INTF — MMIO disable hangs the bus on RG55G1.
+	 * Leave timing running; software just marks the encoder disabled.
+	 */
+	if (dpu_rg55g1_abl_keepalive()) {
+		pr_emerg("dpu: ABL skip INTF disable (keep timing)\n");
+		phys_enc->enable_state = DPU_ENC_DISABLED;
 		return;
 	}
 

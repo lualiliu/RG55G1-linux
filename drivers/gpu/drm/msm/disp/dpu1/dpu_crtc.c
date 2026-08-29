@@ -34,6 +34,10 @@
 #include "dpu_core_perf.h"
 #include "dpu_trace.h"
 
+/* RG55G1: keep ABL continuous splash pipeline untouched until KMS takeover. */
+extern bool rg55g1_preserve_abl_display;
+extern bool rg55g1_kms_scanout_ok;
+
 /* layer mixer index on dpu_crtc */
 #define LEFT_MIXER 0
 #define RIGHT_MIXER 1
@@ -912,6 +916,14 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 
 	DRM_DEBUG_ATOMIC("crtc%d\n", crtc->base.id);
 
+	/*
+	 * clear_all_blendstages() here wipes ABL's LM/CTL stage config and
+	 * leaves a black panel while flush never completes. Skip until KMS
+	 * scanout actually owns the pipe.
+	 */
+	if (rg55g1_preserve_abl_display && !rg55g1_kms_scanout_ok)
+		return;
+
 	_dpu_crtc_check_and_setup_lm_bounds(crtc, crtc->state);
 
 	/* encoder will trigger pending mask now */
@@ -972,6 +984,17 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
 	dpu_crtc->event = crtc->state->event;
 	crtc->state->event = NULL;
 	spin_unlock_irqrestore(&dev->event_lock, flags);
+
+	/* ABL owns scanout — do not flush planes / arm CTL. */
+	if (rg55g1_preserve_abl_display && !rg55g1_kms_scanout_ok) {
+		if (dpu_crtc->event) {
+			spin_lock_irqsave(&dev->event_lock, flags);
+			drm_crtc_send_vblank_event(crtc, dpu_crtc->event);
+			dpu_crtc->event = NULL;
+			spin_unlock_irqrestore(&dev->event_lock, flags);
+		}
+		return;
+	}
 
 	/*
 	 * If no mixers has been allocated in dpu_crtc_atomic_check(),
@@ -1093,6 +1116,10 @@ void dpu_crtc_commit_kickoff(struct drm_crtc *crtc)
 	 * nothing else needs to be done.
 	 */
 	if (unlikely(!cstate->num_mixers))
+		return;
+
+	/* ABL splash: skip prepare/kickoff/frame-done timer entirely. */
+	if (rg55g1_preserve_abl_display && !rg55g1_kms_scanout_ok)
 		return;
 
 	DPU_ATRACE_BEGIN("crtc_commit");

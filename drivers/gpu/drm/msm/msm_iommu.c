@@ -803,8 +803,8 @@ struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsig
 }
 
 /*
- * RG55G1: apps-smmu stays in firmware/bypass mode (arm-smmu not bound).
- * MDSS SIDs use phys DMA; program scanout addresses as PA (IOVA == PA).
+ * RG55G1: Prefer identity MMU (IOVA == PA). Attaching apps_smmu to MDSS
+ * replaces ABL firmware bypass and sticks CTL_FLUSH during splash handoff.
  */
 static void msm_identity_detach(struct msm_mmu *mmu)
 {

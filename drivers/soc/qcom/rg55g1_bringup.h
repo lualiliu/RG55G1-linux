@@ -12,6 +12,7 @@ int rg55g1_bringup_usb(void);
 int rg55g1_vbus_refresh(void);
 void rg55g1_force_node_okay(struct device_node *np);
 void rg55g1_force_node_disabled(struct device_node *np);
+void rg55g1_dt_remove_prop(struct device_node *np, const char *name);
 int __init rg55g1_populate_msm_display(void);
 int rg55g1_msm_display_retry(void);
 int __init rg55g1_usb_serial_bringup(void);
@@ -31,7 +32,14 @@ extern bool rg55g1_abl_panel_ready;
 
 /* Keep ABL continuous splash / GDSC during first attach (cleared after quiesce). */
 extern bool rg55g1_preserve_abl_display;
+
+/* Set once DPU CTL_FLUSH clears under ABL keepalive — GEM scanout is live. */
+extern bool rg55g1_kms_scanout_ok;
+
 void rg55g1_dispcc_quiesce_splash(void);
+
+/* Ensure apps-SMMU MDSS SID 0x800 is phys-DMA bypass (ABL splash). */
+int rg55g1_ensure_mdss_smmu_bypass(void);
 
 /* Skip MDSS hardware reset while attaching during bring-up. */
 extern bool rg55g1_skip_mdss_reset;
@@ -41,6 +49,10 @@ extern bool rg55g1_skip_mdss_populate;
 
 #if IS_ENABLED(CONFIG_SM_DISPCC_4450)
 int rg55g1_dispcc_driver_register(void);
+#endif
+
+#if IS_ENABLED(CONFIG_SM_GPUCC_4450)
+int rg55g1_gpucc_driver_register(void);
 #endif
 
 #if IS_ENABLED(CONFIG_DRM_MSM)

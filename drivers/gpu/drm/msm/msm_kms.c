@@ -7,6 +7,7 @@
 
 #include <linux/aperture.h>
 #include <linux/kthread.h>
+#include <linux/of.h>
 #include <linux/sched/mm.h>
 #include <uapi/linux/sched/types.h>
 
@@ -192,27 +193,19 @@ struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_de
 
 	/*
 	 * IOMMUs can be a part of MDSS device tree binding, or the
-	 * MDP/DPU device.
+	 * MDP/DPU device. ROCKNIX SM4450 attaches apps_smmu 0x800 to MDSS
+	 * after INTF quiesce — use that paging domain (not identity).
 	 */
 	if (device_iommu_mapped(mdp_dev))
 		iommu_dev = mdp_dev;
 	else if (mdss_dev && device_iommu_mapped(mdss_dev))
 		iommu_dev = mdss_dev;
 	else {
-		/*
-		 * RG55G1 keep apps-smmu in firmware/bypass mode. Use identity
-		 * MMU (IOVA == PA) so KMS can still program MDSS scanout.
-		 */
-		drm_info(dev, "no IOMMU — using identity MMU (phys DMA)\n");
+		drm_info(dev, "using identity MMU (phys DMA)\n");
 		mmu = msm_identity_mmu_new(mdp_dev);
 		if (IS_ERR(mmu))
 			return ERR_CAST(mmu);
 
-		/*
-		 * IOVA == PA: VA space must cover DRAM (RG55G1 has 4GiB at
-		 * 0x80000000 → phys up to 0x180000000). A 4G VA window causes
-		 * drm_mm ENOSPC (-28) for high pages (e.g. DSI TX GEM).
-		 */
 		vm = msm_gem_vm_create(dev, mmu, "mdp_kms",
 				       0x1000, (1ULL << 36) - 0x1000, true);
 		if (IS_ERR(vm)) {
@@ -409,16 +402,14 @@ void msm_drm_kms_post_init(struct device *dev)
 	drm_kms_helper_poll_init(ddev);
 
 	/*
-	 * Do NOT quiesce ABL splash here. Stopping INTF then calling
-	 * drm_client_setup() hangs/fails on this panel and leaves a black
-	 * screen with no console. Keep continuous splash until a known-good
-	 * handoff path is ready (rg55g1.msm=1 + future safe modeset).
+	 * After dispcc quiesces ABL INTF, preserve_abl is cleared and a normal
+	 * drm_client_setup modeset owns the panel (ROCKNIX path).
 	 */
 	if (rg55g1_preserve_abl_display) {
-		pr_emerg("msm: skip drm_client_setup (keep ABL splash)\n");
+		pr_emerg("msm: skip drm_client_setup (ABL splash still preserved)\n");
 		return;
 	}
 
-	pr_emerg("msm: drm_client_setup (handoff modeset)\n");
+	pr_emerg("msm: drm_client_setup (modeset after INTF quiesce, panel keep)\n");
 	drm_client_setup(ddev, NULL);
 }

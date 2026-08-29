@@ -19,6 +19,7 @@
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include "sm4450.dtsi"
 #include "sg4250p-anbernic-rg55g1-display.dtsi"
+#include "sg4250p-anbernic-rg55g1-gpu.dtsi"
 #include "sg4250p-anbernic-rg55g1-joypad.dtsi"
 
 / {
@@ -58,6 +59,29 @@
 		regulator-name = "sd-vqmmc-fixed";
 		regulator-min-microvolt = <1800000>;
 		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * DSI host/PHY rails already left on by ABL. RPMh LDO enable times
+	 * out on this board (same class of failure as SD rails) — use fixed
+	 * always-on stubs so msm_dsi power_on can proceed after INTF quiesce.
+	 */
+	reg_dsi_vdda: regulator-dsi-vdda {
+		compatible = "regulator-fixed";
+		regulator-name = "dsi-vdda-fixed";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	reg_dsi_phy_vdds: regulator-dsi-phy-vdds {
+		compatible = "regulator-fixed";
+		regulator-name = "dsi-phy-vdds-fixed";
+		regulator-min-microvolt = <880000>;
+		regulator-max-microvolt = <880000>;
 		regulator-always-on;
 		regulator-boot-on;
 	};
@@ -204,15 +228,19 @@
 		 <&sleep_clk>,
 		 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
 		 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
-	power-domains = <&rpmhpd RPMHPD_MX>;
+	/*
+	 * No rpmhpd: ABL already voted MX for splash; rpmh_write times out
+	 * (-ETIMEDOUT / WARN) and stalls MSM handoff for 10s+ per rail.
+	 */
 	/* Probe only via rg55g1 MSM handoff — early OF probe kills ABL splash. */
 	status = "disabled";
 };
 
 &gpucc {
-	power-domains = <&rpmhpd RPMHPD_CX>,
-			<&rpmhpd RPMHPD_MX>;
-	/* Avoid early rpmhpd vote — rpmh_write times out (WARN -ETIMEDOUT). */
+	/*
+	 * No rpmhpd CX/MX — same RPMh AMC timeout as dispcc. GDSCs inside
+	 * GPUCC still manage GX/CX locally for Adreno.
+	 */
 	status = "disabled";
 };
 
@@ -486,7 +514,8 @@
 
 	/*
 	 * Apps SMMU — SIDs used by USB (0x540), SD (0x140), MDSS (0x800).
-	 * Compatible matches arm-smmu-qcom (SM4450 entry).
+	 * ROCKNIX keeps this enabled; display path quiesces ABL INTF in
+	 * dispcc probe then attaches MDSS with a normal paging domain.
 	 */
 	apps_smmu: iommu@15000000 {
 		compatible = "qcom,sm4450-smmu-500", "qcom,smmu-500",

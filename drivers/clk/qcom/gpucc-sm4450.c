@@ -811,7 +811,27 @@ static struct platform_driver gpu_cc_sm4450_driver = {
 	},
 };
 
-module_platform_driver(gpu_cc_sm4450_driver);
+static bool gpucc_sm4450_registered;
+
+int rg55g1_gpucc_driver_register(void)
+{
+	int ret;
+
+	if (gpucc_sm4450_registered)
+		return 0;
+
+	ret = platform_driver_register(&gpu_cc_sm4450_driver);
+	if (!ret)
+		gpucc_sm4450_registered = true;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rg55g1_gpucc_driver_register);
+
+static int __init gpu_cc_sm4450_init(void)
+{
+	return rg55g1_gpucc_driver_register();
+}
+subsys_initcall(gpu_cc_sm4450_init);
 
 MODULE_DESCRIPTION("QTI GPUCC SM4450 Driver");
 MODULE_LICENSE("GPL");

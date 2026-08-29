@@ -1306,11 +1306,18 @@ EXPORT_SYMBOL(drm_client_modeset_dpms);
  * Returns:
  * 0 on success, or negative error code otherwise.
  */
+/* RG55G1: ABL splash keep-alive — no usable DRM vsync yet. */
+extern bool rg55g1_preserve_abl_display;
+
 int drm_client_modeset_wait_for_vblank(struct drm_client_dev *client, unsigned int crtc_index)
 {
 	struct drm_device *dev = client->dev;
 	struct drm_crtc *crtc;
 	int ret;
+
+	/* ABL splash keep-alive — DRM has no usable vsync IRQ yet. */
+	if (rg55g1_preserve_abl_display)
+		return 0;
 
 	/*
 	 * Rate-limit update frequency to vblank. If there's a DRM master

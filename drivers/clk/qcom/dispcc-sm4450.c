@@ -14,6 +14,7 @@
 #include <linux/sizes.h>
 
 extern bool rg55g1_preserve_abl_display;
+extern bool rg55g1_abl_panel_ready;
 
 #include <dt-bindings/clock/qcom,sm4450-dispcc.h>
 
@@ -765,25 +766,14 @@ MODULE_DEVICE_TABLE(of, disp_cc_sm4450_match_table);
 
 /*
  * Bootloader continuous splash keeps INTF timing running. Stock SDE places
- * INTF at mdss@ae00000 + 0x36000 = 0xae36000 (MDP@ae01000 catalog offset
- * 0x35000). Stop the timing engine and drain one frame before RCG/PLL
- * registration so Linux can take over with a clean modeset (ROCKNIX
- * WIP_SM4450 approach).
+ * INTF at mdss@ae00000 + 0x36000 = 0xae36000. Stop the timing engine and
+ * drain one frame before RCG/PLL registration so Linux can take over with a
+ * clean modeset (ROCKNIX SM4450 approach).
  */
 static void disp_cc_sm4450_quiesce_splash(void)
 {
 	void __iomem *intf;
 	u32 en;
-
-	/*
-	 * While ABL continuous splash must stay visible (preserve_abl), do not
-	 * stop INTF — early quiesce here left a black panel when MSM modeset
-	 * failed or lagged after splash fb registration.
-	 */
-	if (rg55g1_preserve_abl_display) {
-		pr_emerg("dispcc-sm4450: defer INTF quiesce (ABL splash preserve)\n");
-		return;
-	}
 
 	intf = ioremap(0xae36000, SZ_4);
 	if (!intf)
@@ -797,11 +787,18 @@ static void disp_cc_sm4450_quiesce_splash(void)
 		msleep(50);
 	}
 	iounmap(intf);
+
+	/*
+	 * Stop INTF so DPU can own timing/vblank (ROCKNIX). Keep
+	 * abl_panel_ready: this board has no panel reset-gpios, and re-sending
+	 * FT7131M DCS after quiesce always hits DSI CMD DMA TIMEOUT|FIFO.
+	 * Panel/PHY stay as ABL left them; host timing is still reprogrammed.
+	 */
+	rg55g1_preserve_abl_display = false;
 }
 
 void rg55g1_dispcc_quiesce_splash(void)
 {
-	rg55g1_preserve_abl_display = false;
 	disp_cc_sm4450_quiesce_splash();
 }
 EXPORT_SYMBOL_GPL(rg55g1_dispcc_quiesce_splash);
@@ -818,16 +815,8 @@ static int disp_cc_sm4450_probe(struct platform_device *pdev)
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
-	/*
-	 * While ABL continuous splash is live, do not touch lucid PLLs —
-	 * reconfiguring them stops panel scanout (black hang after splash fb).
-	 */
-	if (!rg55g1_preserve_abl_display) {
-		clk_lucid_evo_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
-		clk_lucid_evo_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll0_config);
-	} else {
-		pr_emerg("dispcc-sm4450: skip PLL reconfigure (ABL splash preserve)\n");
-	}
+	clk_lucid_evo_pll_configure(&disp_cc_pll0, regmap, &disp_cc_pll0_config);
+	clk_lucid_evo_pll_configure(&disp_cc_pll1, regmap, &disp_cc_pll0_config);
 
 	/* Keep some clocks always enabled */
 	qcom_branch_set_clk_en(regmap, 0xe070); /* DISP_CC_SLEEP_CLK */
@@ -837,14 +826,12 @@ static int disp_cc_sm4450_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (!rg55g1_preserve_abl_display) {
-		pll0 = clk_hw_get_clk(&disp_cc_pll0.clkr.hw, "dispcc");
-		if (!IS_ERR(pll0)) {
-			(void)clk_set_rate(pll0, 600000000);
-			pr_emerg("dispcc-sm4450: bi_tcxo_fixed=19200000 pll0 rate=%lu\n",
-				 clk_get_rate(pll0));
-			clk_put(pll0);
-		}
+	pll0 = clk_hw_get_clk(&disp_cc_pll0.clkr.hw, "dispcc");
+	if (!IS_ERR(pll0)) {
+		(void)clk_set_rate(pll0, 600000000);
+		pr_emerg("dispcc-sm4450: bi_tcxo_fixed=19200000 pll0 rate=%lu\n",
+			 clk_get_rate(pll0));
+		clk_put(pll0);
 	}
 
 	return 0;

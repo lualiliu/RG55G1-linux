@@ -45,6 +45,9 @@
 #include "drm_internal.h"
 #include "drm_crtc_internal.h"
 
+/* RG55G1: ABL splash keep-alive — DRM vsync IRQs never fire. */
+extern bool rg55g1_preserve_abl_display;
+
 static bool drm_fbdev_emulation = true;
 module_param_named(fbdev_emulation, drm_fbdev_emulation, bool, 0600);
 MODULE_PARM_DESC(fbdev_emulation,
@@ -233,9 +236,17 @@ static void drm_fb_helper_fb_dirty(struct drm_fb_helper *helper)
 	unsigned long flags;
 	int ret;
 
-	mutex_lock(&helper->lock);
-	drm_client_modeset_wait_for_vblank(&helper->client, 0);
-	mutex_unlock(&helper->lock);
+	/*
+	 * Under ABL continuous-splash, INTF vsync is not wired into DRM yet —
+	 * drm_crtc_wait_one_vblank() times out every damage cycle with a WARN.
+	 * Skip while preserve is set (do not gate on kms_scanout_ok: that flag
+	 * used to flip true spuriously when CTL_FLUSH was already 0).
+	 */
+	if (!rg55g1_preserve_abl_display) {
+		mutex_lock(&helper->lock);
+		drm_client_modeset_wait_for_vblank(&helper->client, 0);
+		mutex_unlock(&helper->lock);
+	}
 
 	if (drm_WARN_ON_ONCE(dev, !helper->funcs->fb_dirty))
 		return;

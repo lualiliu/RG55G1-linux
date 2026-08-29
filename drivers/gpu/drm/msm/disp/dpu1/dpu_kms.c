@@ -37,6 +37,9 @@
 #include "dpu_vbif.h"
 #include "dpu_writeback.h"
 
+/* RG55G1 ABL continuous splash — skip DRM commit wait until takeover. */
+extern bool rg55g1_preserve_abl_display;
+
 #define CREATE_TRACE_POINTS
 #include "dpu_trace.h"
 
@@ -513,6 +516,10 @@ static void dpu_kms_wait_for_commit_done(struct msm_kms *kms,
 		DPU_ERROR("invalid params\n");
 		return;
 	}
+
+	/* No CTL_FLUSH / vsync under ABL preserve — waiting only spam-errors. */
+	if (rg55g1_preserve_abl_display)
+		return;
 
 	dev = crtc->dev;
 

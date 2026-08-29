@@ -26,6 +26,7 @@
 
 /* RG55G1 ABL continuous splash */
 extern bool rg55g1_preserve_abl_display;
+extern bool rg55g1_kms_scanout_ok;
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_cwb.h"
 #include "dpu_hw_dspp.h"
@@ -2166,6 +2167,15 @@ void dpu_encoder_kickoff(struct drm_encoder *drm_enc)
 
 	trace_dpu_enc_kickoff(DRMID(drm_enc));
 
+	/*
+	 * Do not arm CTL_FLUSH while ABL still owns the pipe — stuck bits
+	 * (0x20840) and frame_done timeouts follow.
+	 */
+	if (rg55g1_preserve_abl_display && !rg55g1_kms_scanout_ok) {
+		DPU_ATRACE_END("encoder_kickoff");
+		return;
+	}
+
 	/* All phys encs are ready to go, trigger the kickoff */
 	_dpu_encoder_kickoff_phys(dpu_enc);
 
@@ -2738,8 +2748,11 @@ static void dpu_encoder_frame_done_timeout(struct timer_list *t)
 		if (atomic_inc_return(&dpu_enc->frame_done_timeout_cnt) == 1)
 			msm_disp_snapshot_state(drm_enc->dev);
 	} else {
+		static unsigned long last_j;
+
 		atomic_inc(&dpu_enc->frame_done_timeout_cnt);
-		pr_emerg("dpu: ABL skip disp snapshot on frame_done timeout\n");
+		if (printk_timed_ratelimit(&last_j, 5000))
+			pr_err("dpu: ABL skip disp snapshot on frame_done timeout\n");
 	}
 
 	event = DPU_ENCODER_FRAME_EVENT_ERROR;

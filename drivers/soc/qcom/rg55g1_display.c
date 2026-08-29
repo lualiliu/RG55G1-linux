@@ -11,10 +11,13 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/sizes.h>
 #include <linux/soc/qcom/smem.h>
 #include <drm/drm_mipi_dsi.h>
 
 #if IS_ENABLED(CONFIG_DRM_MSM)
+#include <drm/clients/drm_client_setup.h>
+#include <drm/drm_fb_helper.h>
 #include "../../gpu/drm/msm/msm_drv.h"
 #endif
 
@@ -98,11 +101,18 @@ static void rg55g1_enable_mdss_tree(struct device_node *mdss_np)
 	if (!mdss_np)
 		return;
 
+	/*
+	 * Keep MDSS CORE GDSC (dispcc). Only strip rpmhpd on DPU/DSI —
+	 * of_platform_notify probes on status=okay and rpmh_write() stalls.
+	 */
 	rg55g1_force_node_okay(mdss_np);
 	for_each_child_of_node(mdss_np, child) {
+		rg55g1_dt_remove_prop(child, "power-domains");
 		rg55g1_force_node_okay(child);
-		for_each_child_of_node(child, grand)
+		for_each_child_of_node(child, grand) {
+			rg55g1_dt_remove_prop(grand, "power-domains");
 			rg55g1_force_node_okay(grand);
+		}
 	}
 }
 
@@ -189,6 +199,8 @@ static int rg55g1_ensure_dispcc(void)
 		return -ENODEV;
 	}
 
+	/* Strip rpmhpd before status flip — OF notify probes synchronously. */
+	rg55g1_dt_remove_prop(np, "power-domains");
 	rg55g1_force_node_okay(np);
 	rg55_msm_step("MSM-DISPCC-PROBE");
 	ret = rg55g1_create_platform_dev(np);
@@ -202,7 +214,94 @@ static int rg55g1_ensure_dispcc(void)
 	rg55g1_msm_unblock_deferred_probe();
 	/* Keep ABL splash until KMS is ready — quiesce happens on KMS-OK. */
 	rg55g1_status("DISPCC-OK", 0x0000ff00);
-	pr_emerg("rg55g1: dispcc probe done (ABL splash still active)\n");
+	pr_emerg("rg55g1: dispcc probe done (INTF quiesced, panel keep)\n");
+	return 0;
+}
+
+static struct device_node *rg55g1_find_gpucc_node(void)
+{
+	return of_find_compatible_node(NULL, NULL, "qcom,sm4450-gpucc");
+}
+
+static int rg55g1_ensure_gpucc(void)
+{
+	struct device_node *np;
+	int ret = 0;
+
+	rg55_msm_step("MSM-GPUCC");
+
+#if IS_ENABLED(CONFIG_SM_GPUCC_4450)
+	ret = rg55g1_gpucc_driver_register();
+	if (ret) {
+		pr_emerg("rg55g1: gpucc driver register failed: %d\n", ret);
+		return ret;
+	}
+#endif
+
+	np = rg55g1_find_gpucc_node();
+	if (!np) {
+		pr_emerg("rg55g1: no gpucc DT node\n");
+		return -ENODEV;
+	}
+
+	rg55g1_dt_remove_prop(np, "power-domains");
+	rg55g1_force_node_okay(np);
+	ret = rg55g1_create_platform_dev(np);
+	of_node_put(np);
+	if (ret) {
+		pr_emerg("rg55g1: gpucc create failed: %d\n", ret);
+		return ret;
+	}
+
+	msleep(50);
+	rg55g1_msm_unblock_deferred_probe();
+	pr_emerg("rg55g1: gpucc probe kicked\n");
+	return 0;
+}
+
+static int rg55g1_ensure_gpu(void)
+{
+	static const char * const gpu_compats[] = {
+		"qcom,adreno-gmu-wrapper",
+		"qcom,adreno-smmu",
+		"qcom,adreno-613.0",
+	};
+	size_t i;
+	int ret = 0;
+
+	rg55_msm_step("MSM-GPU");
+
+	ret = rg55g1_ensure_gpucc();
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(gpu_compats); i++) {
+		struct device_node *np;
+
+		np = of_find_compatible_node(NULL, NULL, gpu_compats[i]);
+		if (!np)
+			continue;
+
+		/*
+		 * Keep gpucc CX/GX GDSCs on gmu/smmu; only drop rpmhpd-style
+		 * domains that were left on the Adreno GPU node.
+		 */
+		if (of_device_is_compatible(np, "qcom,adreno-613.0") ||
+		    of_device_is_compatible(np, "qcom,adreno"))
+			rg55g1_dt_remove_prop(np, "power-domains");
+
+		rg55g1_force_node_okay(np);
+		ret = rg55g1_create_platform_dev(np);
+		if (ret)
+			pr_emerg("rg55g1: create %s failed: %d\n",
+				 gpu_compats[i], ret);
+		else
+			pr_emerg("rg55g1: enabled %pOF\n", np);
+		of_node_put(np);
+	}
+
+	msleep(100);
+	rg55g1_msm_unblock_deferred_probe();
 	return 0;
 }
 
@@ -385,35 +484,84 @@ static void rg55g1_msm_bringup_children(struct device_node *mdss_np)
 }
 
 #if IS_ENABLED(CONFIG_DRM_MSM)
-static bool rg55g1_msm_drm_registered(struct device_node *mdss_np)
+static struct drm_device *rg55g1_msm_get_drm(struct device_node *mdss_np)
 {
 	struct device_node *dpu_np;
 	struct platform_device *pdev;
 	struct msm_drm_private *priv;
-	bool registered = false;
+	struct drm_device *ddev = NULL;
 
 	dpu_np = of_get_compatible_child(mdss_np, "qcom,sm4450-dpu");
 	if (!dpu_np)
 		dpu_np = of_get_compatible_child(mdss_np, "qcom,ravelin-dpu");
 	if (!dpu_np)
-		return false;
+		return NULL;
 
 	pdev = of_find_device_by_node(dpu_np);
 	of_node_put(dpu_np);
 	if (!pdev)
-		return false;
+		return NULL;
 
 	priv = platform_get_drvdata(pdev);
 	if (priv && priv->dev && priv->dev->registered)
-		registered = true;
+		ddev = priv->dev;
 
 	put_device(&pdev->dev);
-	return registered;
+	return ddev;
+}
+
+static bool rg55g1_msm_drm_registered(struct device_node *mdss_np)
+{
+	return !!rg55g1_msm_get_drm(mdss_np);
+}
+
+/*
+ * After dispcc quiesce, msm_drm_kms_post_init() already ran drm_client_setup.
+ * Only create msmdrmfb here if that path was skipped (preserve still set).
+ */
+static void rg55g1_msm_fbdev_handoff(struct device_node *mdss_np)
+{
+	struct drm_device *ddev;
+	struct fb_info *info;
+
+	ddev = rg55g1_msm_get_drm(mdss_np);
+	if (!ddev) {
+		pr_emerg("rg55g1: fbdev handoff — no drm device\n");
+		return;
+	}
+
+	if (ddev->fb_helper) {
+		info = ddev->fb_helper->info;
+		pr_emerg("rg55g1: fbdev already present (%s) preserve=%d\n",
+			 info ? info->fix.id : "?",
+			 rg55g1_preserve_abl_display);
+		return;
+	}
+
+	/*
+	 * preserve cleared by dispcc quiesce. Keep abl_panel_ready so panel
+	 * DCS + PHY reset are skipped (no reset GPIO on this board).
+	 */
+	rg55g1_preserve_abl_display = false;
+
+	pr_emerg("rg55g1: drm_client_setup (modeset, ABL panel keep)\n");
+	drm_client_setup(ddev, NULL);
+
+	info = ddev->fb_helper ? ddev->fb_helper->info : NULL;
+	if (info)
+		pr_emerg("rg55g1: fbdev ready id=%s fb%d\n",
+			 info->fix.id, info->node);
+	else
+		pr_emerg("rg55g1: drm_client_setup done but no fb_helper yet\n");
 }
 #else
 static bool rg55g1_msm_drm_registered(struct device_node *mdss_np)
 {
 	return false;
+}
+
+static void rg55g1_msm_fbdev_handoff(struct device_node *mdss_np)
+{
 }
 #endif
 
@@ -558,6 +706,7 @@ static int rg55g1_msm_wait_drm(struct device_node *mdss_np)
 		if (rg55g1_msm_drm_registered(mdss_np)) {
 			rg55g1_status("KMS-OK", 0x0000ff00);
 			pr_emerg("rg55g1: MSM KMS registered (/dev/dri/card msm)\n");
+			rg55g1_msm_fbdev_handoff(mdss_np);
 			return 0;
 		}
 	}
@@ -699,13 +848,19 @@ int rg55g1_msm_display_retry(void)
 	if (!mdss_np)
 		return -ENODEV;
 
-	rg55g1_enable_mdss_tree(mdss_np);
-
+	/* Clocks first — enabling MDSS before DISPCC causes -ETIMEDOUT. */
 	ret = rg55g1_ensure_dispcc();
 	if (ret) {
 		of_node_put(mdss_np);
 		return ret;
 	}
+
+	ret = rg55g1_ensure_gpu();
+	if (ret)
+		pr_emerg("rg55g1: GPU bringup soft-fail: %d (KMS may be display-only)\n",
+			 ret);
+
+	rg55g1_enable_mdss_tree(mdss_np);
 
 	ret = rg55g1_ensure_mdss_phy(mdss_np);
 	if (ret) {
@@ -746,24 +901,21 @@ int __init rg55g1_populate_msm_display(void)
 	}
 #endif
 
+	ret = rg55g1_ensure_dispcc();
+	if (ret)
+		return ret;
+
+	ret = rg55g1_ensure_gpu();
+	if (ret)
+		pr_emerg("rg55g1: GPU bringup soft-fail: %d (KMS may be display-only)\n",
+			 ret);
+
 	{
 		struct device_node *mdss_np = rg55g1_find_mdss_node();
 
 		if (!mdss_np)
 			return -ENODEV;
 		rg55g1_enable_mdss_tree(mdss_np);
-		of_node_put(mdss_np);
-	}
-
-	ret = rg55g1_ensure_dispcc();
-	if (ret)
-		return ret;
-
-	{
-		struct device_node *mdss_np = rg55g1_find_mdss_node();
-
-		if (!mdss_np)
-			return -ENODEV;
 		ret = rg55g1_ensure_mdss_phy(mdss_np);
 		of_node_put(mdss_np);
 		if (ret)

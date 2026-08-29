@@ -1130,6 +1130,12 @@ int a6xx_zap_shader_init(struct msm_gpu *gpu)
 		return 0;
 
 	ret = adreno_zap_shader_load(gpu, GPU_PAS_ID);
+	if (!ret)
+		pr_emerg("adreno: zap shader loaded OK\n");
+	else if (ret == -ENODEV)
+		pr_emerg("adreno: zap not required (ENODEV)\n");
+	else
+		pr_emerg("adreno: zap shader load failed: %d\n", ret);
 
 	loaded = !ret;
 	return ret;

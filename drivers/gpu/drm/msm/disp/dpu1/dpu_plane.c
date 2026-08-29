@@ -28,6 +28,10 @@
 #include "dpu_vbif.h"
 #include "dpu_plane.h"
 
+/* RG55G1: do not reprogram SSPP while ABL owns splash scanout. */
+extern bool rg55g1_preserve_abl_display;
+extern bool rg55g1_kms_scanout_ok;
+
 #define DPU_DEBUG_PLANE(pl, fmt, ...) DRM_DEBUG_ATOMIC("plane%d " fmt,\
 		(pl) ? (pl)->base.base.id : -1, ##__VA_ARGS__)
 
@@ -1626,6 +1630,10 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
 	pdpu->is_error = false;
 
 	DPU_DEBUG_PLANE(pdpu, "\n");
+
+	/* Leave ABL SSPP/src addresses alone until flush/takeover works. */
+	if (rg55g1_preserve_abl_display && !rg55g1_kms_scanout_ok)
+		return;
 
 	if (!new_state->visible) {
 		_dpu_plane_atomic_disable(plane);
