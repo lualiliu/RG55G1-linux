@@ -8,7 +8,10 @@
  *
  * Stock uses qcom,pmk8350-pwrkey / resin + gpio-keys. On this bring-up
  * TLMM gpiochip panics and SPMI IRQ path is unreliable, so one polled
- * input device reads TLMM MMIO + SPMI debug arb instead.
+ * input device reads TLMM MMIO + SPMI debug/main arb.
+ *
+ * LV6 of_platform can probe this node before SPMI controllers exist;
+ * advertise all three keys up front and late-attach SPMI from poll.
  */
 #include <linux/input.h>
 #include <linux/io.h>
@@ -39,6 +42,8 @@
 #define DEFAULT_VOL_UP_GPIO	53
 #define DEFAULT_PON_SID		0
 #define DEFAULT_PON_BASE	0x1300
+/* Retry SPMI attach about once per second at the default poll rate. */
+#define SPMI_ATTACH_EVERY	50
 
 struct rg55g1_keys {
 	struct device *dev;
@@ -54,6 +59,7 @@ struct rg55g1_keys {
 	int last_volup;
 	bool spmi_ok;
 	bool tlmm_ok;
+	unsigned int spmi_retry;
 };
 
 struct rg55_spmi_match {
@@ -86,17 +92,15 @@ static int rg55g1_keys_match_spmi(struct device *dev, void *data)
 	return 1;
 }
 
-static struct spmi_controller *rg55g1_keys_get_spmi(void)
+static struct spmi_controller *rg55g1_keys_get_spmi_one(bool want_debug)
 {
 	struct device_node *np;
 	struct platform_device *pdev;
-	struct rg55_spmi_match m = { .want_debug = true };
+	struct rg55_spmi_match m = { .want_debug = want_debug };
 
-	np = of_find_compatible_node(NULL, NULL, "qcom,spmi-pmic-arb-debug");
-	if (!np) {
-		m.want_debug = false;
-		np = of_find_compatible_node(NULL, NULL, "qcom,spmi-pmic-arb");
-	}
+	np = of_find_compatible_node(NULL, NULL,
+				     want_debug ? "qcom,spmi-pmic-arb-debug" :
+						  "qcom,spmi-pmic-arb");
 	if (!np)
 		return NULL;
 
@@ -108,6 +112,21 @@ static struct spmi_controller *rg55g1_keys_get_spmi(void)
 	device_for_each_child(&pdev->dev, &m, rg55g1_keys_match_spmi);
 	put_device(&pdev->dev);
 	return m.ctrl;
+}
+
+/*
+ * Prefer debug arb (bypasses EE ownership), then fall back to the main
+ * arb. Looking only at debug left POWER/VOLUMEDOWN dead when debug was
+ * deferred on aoss_qmp while the main arb was already up.
+ */
+static struct spmi_controller *rg55g1_keys_get_spmi(void)
+{
+	struct spmi_controller *ctrl;
+
+	ctrl = rg55g1_keys_get_spmi_one(true);
+	if (ctrl)
+		return ctrl;
+	return rg55g1_keys_get_spmi_one(false);
 }
 
 static int rg55g1_keys_sid_read(struct spmi_controller *ctrl, u8 sid, u16 addr,
@@ -123,6 +142,32 @@ static int rg55g1_keys_sid_read(struct spmi_controller *ctrl, u8 sid, u16 addr,
 	ret = spmi_ext_register_readl(sdev, addr, val, 1);
 	put_device(&sdev->dev);
 	return ret;
+}
+
+static bool rg55g1_keys_try_attach_spmi(struct rg55g1_keys *keys)
+{
+	u8 sts;
+
+	if (keys->spmi_ok)
+		return true;
+
+	if (!keys->spmi)
+		keys->spmi = rg55g1_keys_get_spmi();
+	if (!keys->spmi)
+		return false;
+
+	if (rg55g1_keys_sid_read(keys->spmi, keys->pon_sid,
+				  keys->pon_base + PON_RT_STS, &sts)) {
+		/* Controller present but not usable yet — retry later. */
+		keys->spmi = NULL;
+		return false;
+	}
+
+	keys->spmi_ok = true;
+	pr_emerg("rg55g1-keys: PON@sid%u/0x%x RT_STS=0x%02x%s\n",
+		 keys->pon_sid, keys->pon_base, sts,
+		 keys->input ? " (late)" : "");
+	return true;
 }
 
 static void rg55g1_keys_tlmm_cfg_input(struct rg55g1_keys *keys, int gpio)
@@ -155,6 +200,13 @@ static void rg55g1_keys_poll(struct input_dev *input)
 	bool changed = false;
 	u8 sts;
 	int raw, pressed;
+
+	if (!keys->spmi_ok) {
+		if (++keys->spmi_retry >= SPMI_ATTACH_EVERY) {
+			keys->spmi_retry = 0;
+			rg55g1_keys_try_attach_spmi(keys);
+		}
+	}
 
 	if (keys->spmi_ok && keys->spmi) {
 		if (!rg55g1_keys_sid_read(keys->spmi, keys->pon_sid,
@@ -251,26 +303,13 @@ static int rg55g1_keys_probe(struct platform_device *pdev)
 		dev_warn(&pdev->dev, "TLMM ioremap failed; no VOLUMEUP\n");
 	}
 
-	keys->spmi = rg55g1_keys_get_spmi();
-	if (keys->spmi) {
-		u8 sts;
-
-		if (!rg55g1_keys_sid_read(keys->spmi, keys->pon_sid,
-					  keys->pon_base + PON_RT_STS, &sts)) {
-			keys->spmi_ok = true;
-			dev_info(&pdev->dev,
-				 "PON@sid%u/0x%x RT_STS=0x%02x\n",
-				 keys->pon_sid, keys->pon_base, sts);
-		} else {
-			dev_warn(&pdev->dev,
-				 "PON RT_STS read failed; no POWER/VOLUMEDOWN\n");
-		}
-	} else {
-		dev_warn(&pdev->dev, "no SPMI controller; no POWER/VOLUMEDOWN\n");
-	}
+	/* May fail early under LV6; poll will late-attach once SPMI is up. */
+	if (!rg55g1_keys_try_attach_spmi(keys))
+		dev_warn(&pdev->dev,
+			 "SPMI not ready yet; POWER/VOLUMEDOWN will late-attach\n");
 
 	if (!keys->tlmm_ok && !keys->spmi_ok)
-		return -ENODEV;
+		return -EPROBE_DEFER;
 
 	input = devm_input_allocate_device(&pdev->dev);
 	if (!input)
@@ -286,10 +325,12 @@ static int rg55g1_keys_probe(struct platform_device *pdev)
 	input->id.product = 0x1;
 	input->id.version = 0x100;
 
-	if (keys->spmi_ok) {
-		input_set_capability(input, EV_KEY, KEY_POWER);
-		input_set_capability(input, EV_KEY, KEY_VOLUMEDOWN);
-	}
+	/*
+	 * Always advertise PON keys so userspace (input_sense / evtest) sees
+	 * them even if SPMI attaches a second later.
+	 */
+	input_set_capability(input, EV_KEY, KEY_POWER);
+	input_set_capability(input, EV_KEY, KEY_VOLUMEDOWN);
 	if (keys->tlmm_ok)
 		input_set_capability(input, EV_KEY, KEY_VOLUMEUP);
 
@@ -308,7 +349,7 @@ static int rg55g1_keys_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, keys);
 	pr_emerg("rg55g1-keys: registered (vol-up gpio%d%s, pon sid%u@0x%x%s)\n",
 		 keys->vol_up_gpio, keys->tlmm_ok ? "" : " off",
-		 keys->pon_sid, keys->pon_base, keys->spmi_ok ? "" : " off");
+		 keys->pon_sid, keys->pon_base, keys->spmi_ok ? "" : " pending");
 	return 0;
 }
 
