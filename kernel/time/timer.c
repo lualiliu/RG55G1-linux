@@ -44,6 +44,7 @@
 #include <linux/compat.h>
 #include <linux/random.h>
 #include <linux/sysctl.h>
+#include <linux/printk.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -1784,7 +1785,16 @@ static void expire_timers(struct timer_base *base, struct hlist_head *head)
 		fn = timer->function;
 
 		if (WARN_ON_ONCE(!fn)) {
-			/* Should never happen. Emphasis on should! */
+			/*
+			 * Pending timer with a NULL callback: usually
+			 * timer_shutdown_sync race (CVE-2025-68214) or
+			 * use-after-free of an object embedding timer_list /
+			 * delayed_work. Dump enough to identify the object.
+			 */
+			pr_err("timer: NULL function timer=%px flags=0x%x expires=%lu\n",
+			       timer, timer->flags, timer->expires);
+			print_hex_dump(KERN_ERR, "timer: ", DUMP_PREFIX_OFFSET,
+				       16, 1, timer, sizeof(*timer), false);
 			base->running_timer = NULL;
 			continue;
 		}

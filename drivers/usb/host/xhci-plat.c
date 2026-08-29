@@ -47,11 +47,27 @@ struct rg55g1_xhci_poll {
 /* PORTSC RW1C change bits — writing 1 clears; must mask when setting PP. */
 #define RG55_PORT_RWC	PORT_CHANGE_MASK
 
+/* Single host on RG55G1 — remove must cancel before usb_remove_hcd. */
+static struct rg55g1_xhci_poll *rg55g1_xhci_poll;
+
+static bool rg55g1_xhci_poll_alive(struct rg55g1_xhci_poll *p,
+				   struct xhci_hcd *xhci, struct usb_hcd *hcd)
+{
+	if (!p || !xhci || p->xhci != xhci)
+		return false;
+	if (xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED |
+			       XHCI_STATE_REMOVING))
+		return false;
+	if (!hcd || !HCD_HW_ACCESSIBLE(hcd))
+		return false;
+	return true;
+}
+
 static void rg55g1_xhci_poll_fn(struct work_struct *work)
 {
 	struct rg55g1_xhci_poll *p =
 		container_of(to_delayed_work(work), struct rg55g1_xhci_poll, work);
-	struct xhci_hcd *xhci = p->xhci;
+	struct xhci_hcd *xhci = READ_ONCE(p->xhci);
 	struct usb_hcd *hcd;
 	u32 u2 = 0, u3 = 0;
 	char msg[48];
@@ -64,6 +80,9 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 		return;
 
 	hcd = xhci->main_hcd;
+	if (!rg55g1_xhci_poll_alive(p, xhci, hcd))
+		return;
+
 	p->ticks++;
 
 	was_conn = !!(p->last_u2 & PORT_CONNECT);
@@ -101,7 +120,7 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 		 * Drain only when idle (trylock): never race cmd-wait drain
 		 * during ENABLE_SLOT after keyboard plug.
 		 */
-		if (allow && hcd)
+		if (allow && rg55g1_xhci_poll_alive(p, xhci, hcd))
 			(void)xhci_rg55_drain_irq_if_idle(hcd);
 
 		/*
@@ -281,7 +300,9 @@ static void rg55g1_xhci_poll_fn(struct work_struct *work)
 	}
 	}
 
-	schedule_delayed_work(&p->work, msecs_to_jiffies(200));
+	/* Do not re-arm across remove / role-switch teardown. */
+	if (rg55g1_xhci_poll_alive(p, xhci, hcd))
+		schedule_delayed_work(&p->work, msecs_to_jiffies(200));
 }
 
 static int xhci_plat_setup(struct usb_hcd *hcd);
@@ -670,12 +691,18 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 			 * run ENABLE_SLOT on the probe path and stall boot.
 			 * Delayed work will kick hub + drain events.
 			 */
+			if (rg55g1_xhci_poll) {
+				cancel_delayed_work_sync(&rg55g1_xhci_poll->work);
+				rg55g1_xhci_poll->xhci = NULL;
+				rg55g1_xhci_poll = NULL;
+			}
 			poll = devm_kzalloc(&pdev->dev, sizeof(*poll),
 					    GFP_KERNEL);
 			if (poll) {
 				poll->xhci = xhci;
 				INIT_DELAYED_WORK(&poll->work,
 						  rg55g1_xhci_poll_fn);
+				rg55g1_xhci_poll = poll;
 				schedule_delayed_work(&poll->work,
 						      msecs_to_jiffies(100));
 			}
@@ -766,6 +793,15 @@ void xhci_plat_remove(struct platform_device *dev)
 	struct usb_hcd *shared_hcd = xhci->shared_hcd;
 
 	xhci->xhc_state |= XHCI_STATE_REMOVING;
+	/*
+	 * Stop PORTSC poll before HCD teardown — otherwise the worker calls
+	 * xhci_irq() on unmapped op_regs (Oops after "USB bus deregistered").
+	 */
+	if (rg55g1_xhci_poll) {
+		cancel_delayed_work_sync(&rg55g1_xhci_poll->work);
+		WRITE_ONCE(rg55g1_xhci_poll->xhci, NULL);
+		rg55g1_xhci_poll = NULL;
+	}
 	pm_runtime_get_sync(&dev->dev);
 
 	if (shared_hcd) {

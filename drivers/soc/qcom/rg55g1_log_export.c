@@ -404,7 +404,7 @@ static int rg55g1_log_usb_notify(struct notifier_block *nb,
 		schedule_delayed_work(&rg55g1_log_reattach_work,
 				      msecs_to_jiffies(500));
 	} else if (action == USB_DEVICE_REMOVE) {
-		cancel_delayed_work(&rg55g1_log_reattach_work);
+		cancel_delayed_work_sync(&rg55g1_log_reattach_work);
 		rg55g1_log_clear_port();
 	}
 	return NOTIFY_OK;

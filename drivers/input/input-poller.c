@@ -66,6 +66,23 @@ void input_dev_poller_stop(struct input_dev_poller *poller)
 	cancel_delayed_work_sync(&poller->work);
 }
 
+/**
+ * input_dev_poller_destroy - stop polling and free the poller
+ * @poller: poller allocated by input_setup_polling()
+ *
+ * Must be used instead of a bare kfree(): the embedded delayed_work timer
+ * may still be pending, and freeing it without cancel leaves a timer with a
+ * destroyed callback on the wheel (WARN_ON_ONCE(!fn) in expire_timers).
+ */
+void input_dev_poller_destroy(struct input_dev_poller *poller)
+{
+	if (!poller)
+		return;
+
+	cancel_delayed_work_sync(&poller->work);
+	kfree(poller);
+}
+
 int input_setup_polling(struct input_dev *dev,
 			void (*poll_fn)(struct input_dev *dev))
 {

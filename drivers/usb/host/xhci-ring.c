@@ -3269,13 +3269,30 @@ EXPORT_SYMBOL_GPL(xhci_msi_irq);
  */
 static DEFINE_MUTEX(xhci_rg55_drain_mutex);
 
+static bool xhci_rg55_hcd_drain_ok(struct usb_hcd *hcd)
+{
+	struct xhci_hcd *xhci;
+
+	if (!hcd || !HCD_HW_ACCESSIBLE(hcd))
+		return false;
+	xhci = hcd_to_xhci(hcd);
+	if (!xhci || (xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_HALTED |
+					 XHCI_STATE_REMOVING)))
+		return false;
+	return true;
+}
+
 void xhci_rg55_drain_irq(struct usb_hcd *hcd)
 {
 	unsigned long flags;
 
-	if (!hcd)
+	if (!xhci_rg55_hcd_drain_ok(hcd))
 		return;
 	mutex_lock(&xhci_rg55_drain_mutex);
+	if (!xhci_rg55_hcd_drain_ok(hcd)) {
+		mutex_unlock(&xhci_rg55_drain_mutex);
+		return;
+	}
 	local_irq_save(flags);
 	xhci_irq(hcd);
 	local_irq_restore(flags);
@@ -3287,10 +3304,14 @@ bool xhci_rg55_drain_irq_if_idle(struct usb_hcd *hcd)
 {
 	unsigned long flags;
 
-	if (!hcd)
+	if (!xhci_rg55_hcd_drain_ok(hcd))
 		return false;
 	if (!mutex_trylock(&xhci_rg55_drain_mutex))
 		return false;
+	if (!xhci_rg55_hcd_drain_ok(hcd)) {
+		mutex_unlock(&xhci_rg55_drain_mutex);
+		return false;
+	}
 	local_irq_save(flags);
 	xhci_irq(hcd);
 	local_irq_restore(flags);

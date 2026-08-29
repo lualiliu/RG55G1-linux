@@ -700,8 +700,16 @@ static void input_disconnect_device(struct input_dev *dev)
 	 * not to protect access to dev->going_away but rather to ensure
 	 * that there are no threads in the middle of input_open_device()
 	 */
-	scoped_guard(mutex, &dev->mutex)
+	scoped_guard(mutex, &dev->mutex) {
 		dev->going_away = true;
+		/*
+		 * Stop poller before handlers tear down: release path used to
+		 * kfree(poller) without cancel_delayed_work_sync, which can
+		 * leave a pending timer with a freed callback.
+		 */
+		if (dev->poller)
+			input_dev_poller_stop(dev->poller);
+	}
 
 	guard(spinlock_irq)(&dev->event_lock);
 
@@ -1575,7 +1583,8 @@ static void input_dev_release(struct device *device)
 
 	input_ff_destroy(dev);
 	input_mt_destroy_slots(dev);
-	kfree(dev->poller);
+	input_dev_poller_destroy(dev->poller);
+	dev->poller = NULL;
 	kfree(dev->absinfo);
 	kfree(dev->vals);
 	kfree(dev);
