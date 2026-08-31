@@ -104,14 +104,18 @@
 		button-adc-deadzone = <3200>;
 		button-adc-fuzz = <64>;
 		button-adc-flat = <64>;
-		abs_x-p-tuning = <100>;
-		abs_x-n-tuning = <100>;
-		abs_y-p-tuning = <100>;
-		abs_y-n-tuning = <100>;
-		abs_rx-p-tuning = <100>;
-		abs_rx-n-tuning = <100>;
-		abs_ry-p-tuning = <100>;
-		abs_ry-n-tuning = <100>;
+		/*
+		 * Hall sticks do not reach full ADC rails; amplify so full throw
+		 * saturates to ±(ADC_MAX/2). Driver default is 180.
+		 */
+		abs_x-p-tuning = <180>;
+		abs_x-n-tuning = <180>;
+		abs_y-p-tuning = <180>;
+		abs_y-n-tuning = <180>;
+		abs_rx-p-tuning = <180>;
+		abs_rx-n-tuning = <180>;
+		abs_ry-p-tuning = <180>;
+		abs_ry-n-tuning = <180>;
 		abs_z-p-tuning = <200>;
 		abs_z-n-tuning = <200>;
 		abs_rz-p-tuning = <200>;
@@ -120,7 +124,6 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&gpio_joypad &gpio_joypad_pwr>;
 
-		/* BTN_DPAD_* — match retrogame_joypad / RetroArch / ROCKNIX. */
 		sw1 {
 			label = "GPIO DPAD-UP";
 			gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;

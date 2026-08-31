@@ -123,6 +123,9 @@ struct joypad {
 	int pwr_gpio_pins[8];
 	int pwr_gpio_count;
 
+	int hat0x;
+	int hat0y;
+
 	struct mutex lock;
 };
 
@@ -623,6 +626,7 @@ static void joypad_gpio_check(struct joypad *joypad)
 {
 	int nbtn;
 	bool changed = false;
+	int hat0x = 0, hat0y = 0;
 
 	if (!joypad->gpio_live)
 		return;
@@ -636,27 +640,42 @@ static void joypad_gpio_check(struct joypad *joypad)
 			continue;
 
 		pressed = gpio->active_low ? !raw : raw;
+
+		/* Aggregate ABS_HAT0* from all related GPIOs each poll. */
+		if (gpio->abs_value) {
+			if (pressed) {
+				int dir = (gpio->abs_value == 1) ? 1 :
+					  (gpio->abs_value == 2) ? -1 : 0;
+
+				if (gpio->linux_code == ABS_HAT0X)
+					hat0x = dir;
+				else if (gpio->linux_code == ABS_HAT0Y)
+					hat0y = dir;
+			}
+			gpio->old_value = pressed;
+			continue;
+		}
+
 		if (pressed == gpio->old_value)
 			continue;
 
-		if (gpio->abs_value) {
-			int report = 0;
-
-			if (pressed) {
-				if (gpio->abs_value == 1)
-					report = 1;
-				else if (gpio->abs_value == 2)
-					report = -1;
-			}
-			input_event(poll_dev_input, gpio->report_type,
-				    gpio->linux_code, report);
-		} else {
-			input_event(poll_dev_input, gpio->report_type,
-				    gpio->linux_code, pressed ? 1 : 0);
-		}
+		input_event(poll_dev_input, gpio->report_type,
+			    gpio->linux_code, pressed ? 1 : 0);
 		gpio->old_value = pressed;
 		changed = true;
 	}
+
+	if (hat0x != joypad->hat0x) {
+		input_report_abs(poll_dev_input, ABS_HAT0X, hat0x);
+		joypad->hat0x = hat0x;
+		changed = true;
+	}
+	if (hat0y != joypad->hat0y) {
+		input_report_abs(poll_dev_input, ABS_HAT0Y, hat0y);
+		joypad->hat0y = hat0y;
+		changed = true;
+	}
+
 	if (changed)
 		input_sync(poll_dev_input);
 }
@@ -744,6 +763,8 @@ static void joypad_open_enable(struct joypad *joypad)
 
 	for (nbtn = 0; nbtn < joypad->bt_gpio_count; nbtn++)
 		joypad->gpios[nbtn].old_value = 0;
+	joypad->hat0x = 0;
+	joypad->hat0y = 0;
 
 	mutex_lock(&joypad->lock);
 	joypad->enable = true;
