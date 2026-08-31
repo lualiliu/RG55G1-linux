@@ -791,6 +791,13 @@ static int joypad_adc_setup(struct device *dev, struct joypad *joypad)
 		adc->max = ADC_MAX_VOLTAGE / 2;
 		adc->min = (nbtn == ADC_CHANNEL_Z || nbtn == ADC_CHANNEL_RZ) ?
 			   0 : -(ADC_MAX_VOLTAGE / 2);
+		/*
+		 * MCU sticks idle at ~0x0800, then *=8 → 16384 (= ADC_MAX/2).
+		 * Subtract that mid-point so ABS_X/Y/RX/RY rest at 0 (center
+		 * of [-16384, 16384]). Triggers (Z/RZ) idle near 0 → cal=0.
+		 */
+		adc->cal = (nbtn == ADC_CHANNEL_Z || nbtn == ADC_CHANNEL_RZ) ?
+			   0 : (ADC_MAX_VOLTAGE / 2);
 		if (adc->scale) {
 			adc->max *= adc->scale;
 			adc->min *= adc->scale;
@@ -999,9 +1006,6 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 
 		input_set_capability(input, gpio->report_type, gpio->linux_code);
 	}
-
-	input_set_abs_params(input, ABS_HAT0X, -1, 1, 0, 0);
-	input_set_abs_params(input, ABS_HAT0Y, -1, 1, 0, 0);
 
 	if (joypad->auto_repeat)
 		__set_bit(EV_REP, input->evbit);

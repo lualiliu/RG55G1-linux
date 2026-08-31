@@ -120,36 +120,33 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&gpio_joypad &gpio_joypad_pwr>;
 
+		/* BTN_DPAD_* — match retrogame_joypad / RetroArch / ROCKNIX. */
 		sw1 {
 			label = "GPIO DPAD-UP";
 			gpios = <&tlmm 35 GPIO_ACTIVE_LOW>;
-			linux,code = <ABS_HAT0Y>;
-			linux,input-type = <EV_ABS>;
-			linux,abs-value = <2>;
+			linux,code = <BTN_DPAD_UP>;
+			linux,input-type = <EV_KEY>;
 			debounce-interval = <2>;
 		};
 		sw2 {
 			label = "GPIO DPAD-DOWN";
 			gpios = <&tlmm 52 GPIO_ACTIVE_LOW>;
-			linux,code = <ABS_HAT0Y>;
-			linux,input-type = <EV_ABS>;
-			linux,abs-value = <1>;
+			linux,code = <BTN_DPAD_DOWN>;
+			linux,input-type = <EV_KEY>;
 			debounce-interval = <2>;
 		};
 		sw3 {
 			label = "GPIO DPAD-LEFT";
 			gpios = <&tlmm 57 GPIO_ACTIVE_LOW>;
-			linux,code = <ABS_HAT0X>;
-			linux,input-type = <EV_ABS>;
-			linux,abs-value = <2>;
+			linux,code = <BTN_DPAD_LEFT>;
+			linux,input-type = <EV_KEY>;
 			debounce-interval = <2>;
 		};
 		sw4 {
 			label = "Gamepad DPAD-RIGHT";
 			gpios = <&tlmm 58 GPIO_ACTIVE_LOW>;
-			linux,code = <ABS_HAT0X>;
-			linux,input-type = <EV_ABS>;
-			linux,abs-value = <1>;
+			linux,code = <BTN_DPAD_RIGHT>;
+			linux,input-type = <EV_KEY>;
 			debounce-interval = <2>;
 		};
 		sw5 {
