@@ -183,6 +183,8 @@
 				compatible = "focaltech,ft7131m";
 				reg = <0>;
 
+				rotation = <90>;
+
 				port {
 					ft7131m_in: endpoint {
 						remote-endpoint = <&mdss_dsi0_out>;

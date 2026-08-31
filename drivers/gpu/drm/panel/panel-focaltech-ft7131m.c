@@ -25,6 +25,7 @@ struct ft7131m {
 	struct mipi_dsi_device *dsi;
 	struct regulator *vdda;
 	struct gpio_desc *reset;
+	enum drm_panel_orientation orientation;
 };
 
 static inline struct ft7131m *panel_to_ft7131m(struct drm_panel *panel)
@@ -138,10 +139,18 @@ static int ft7131m_get_modes(struct drm_panel *panel,
 	return drm_connector_helper_get_modes_fixed(connector, &ft7131m_mode);
 }
 
+static enum drm_panel_orientation ft7131m_get_orientation(struct drm_panel *panel)
+{
+	struct ft7131m *ctx = panel_to_ft7131m(panel);
+
+	return ctx->orientation;
+}
+
 static const struct drm_panel_funcs ft7131m_funcs = {
 	.prepare = ft7131m_prepare,
 	.unprepare = ft7131m_unprepare,
 	.get_modes = ft7131m_get_modes,
+	.get_orientation = ft7131m_get_orientation,
 };
 
 static int ft7131m_probe(struct mipi_dsi_device *dsi)
@@ -169,6 +178,13 @@ static int ft7131m_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx->reset))
 		return dev_err_probe(&dsi->dev, PTR_ERR(ctx->reset),
 				     "failed to get reset GPIO\n");
+
+	ret = of_drm_get_panel_orientation(dsi->dev.of_node, &ctx->orientation);
+	if (ret) {
+		dev_err(&dsi->dev, "%pOF: failed to get orientation: %d\n",
+			dsi->dev.of_node, ret);
+		return ret;
+	}
 
 	ret = drm_panel_of_backlight(&ctx->panel);
 	if (ret && ret != -ENODEV)
